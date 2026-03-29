@@ -247,53 +247,131 @@ class LearningCapture:
         messages: list[Message],
     ) -> None:
         """
-        Append a structured record to a JSONL export file.
-        Format is compatible with OpenAI / Anthropic fine-tuning pipelines.
+        Append structured records to three JSONL export files.
 
-        Each record = one training example:
-          {messages: [{role, content}, ...], metadata: {council_id, topic, ...}}
+        FILE 1: council_training_data.jsonl
+            Full conversation per session. OpenAI/Anthropic chat fine-tuning format.
+            Each record = one complete debate session as a multi-turn conversation.
+
+        FILE 2: agent_persona_training.jsonl
+            Per-agent SFT examples. Each record = system prompt (with role + self_model) +
+            the human turn that prompted the agent + the agent's actual response.
+            Use this to fine-tune models to speak with a specific agent's persona.
+
+        FILE 3: agent_self_model_evolution.jsonl
+            Self-model insights per agent per session. Tracks how each agent's self-awareness
+            evolves over time. Use as a DPO/preference dataset: later self-models are
+            "preferred" over earlier ones (they're more accurate about the agent's patterns).
         """
         try:
             _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-            export_file = _EXPORT_DIR / "council_training_data.jsonl"
+            now_iso = datetime.now(timezone.utc).isoformat()
+            meta_base = {
+                "council_id": str(council.id),
+                "title": council.title,
+                "topic": council.topic,
+                "mode": council.mode,
+                "exported_at": now_iso,
+            }
 
-            # Build conversation in standard format
+            # ── FILE 1: Full conversation (existing format, unchanged) ──────────
             conversation = []
             for msg in messages:
                 if msg.role == "agent" and msg.agent:
-                    name = msg.agent.name
                     conversation.append({
                         "role": "assistant",
-                        "name": name,
+                        "name": msg.agent.name,
                         "content": msg.content,
                     })
                 elif msg.role == "human":
-                    conversation.append({
-                        "role": "user",
-                        "content": msg.content,
-                    })
+                    conversation.append({"role": "user", "content": msg.content})
                 elif msg.role == "system":
-                    conversation.append({
-                        "role": "system",
-                        "content": msg.content,
-                    })
+                    conversation.append({"role": "system", "content": msg.content})
 
-            record = {
-                "messages": conversation,
-                "metadata": {
-                    "council_id": str(council.id),
-                    "title": council.title,
-                    "topic": council.topic,
-                    "mode": council.mode,
-                    "message_count": len(messages),
-                    "exported_at": datetime.now(timezone.utc).isoformat(),
-                },
-            }
+            with open(_EXPORT_DIR / "council_training_data.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "messages": conversation,
+                    "metadata": {**meta_base, "message_count": len(messages)},
+                }, ensure_ascii=False) + "\n")
 
-            with open(export_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # ── FILE 2: Per-agent persona SFT examples ───────────────────────────
+            # For each agent response, build: system(persona) + user(question) → assistant(response)
+            persona_file = _EXPORT_DIR / "agent_persona_training.jsonl"
+            agent_msgs: dict[str, list] = {}
+            for msg in messages:
+                if msg.role == "agent" and msg.agent:
+                    agent_msgs.setdefault(msg.agent.name, []).append(msg)
 
-            logger.info("Training record exported for council %s (%d turns)", council.id, len(conversation))
+            # Find each human message and pair it with subsequent agent responses
+            human_turns = [m for m in messages if m.role == "human"]
+            with open(persona_file, "a", encoding="utf-8") as f:
+                for agent_name, agent_responses in agent_msgs.items():
+                    for agent_msg in agent_responses:
+                        # Find the human turn that preceded this response
+                        preceding_human = None
+                        for hm in reversed(human_turns):
+                            if hm.created_at < agent_msg.created_at:
+                                preceding_human = hm
+                                break
+                        if not preceding_human:
+                            continue
+                        # Find the agent object for role/personality
+                        agent_obj = next(
+                            (m.agent for m in messages if m.role == "agent" and m.agent and m.agent.name == agent_name),
+                            None,
+                        )
+                        role_desc = (agent_obj.role or agent_name) if agent_obj else agent_name
+                        persona_sys = (
+                            f"You are {agent_name}, a {role_desc}. "
+                            f"Topic: {council.topic}. "
+                            "Respond directly and concisely from your domain perspective. "
+                            "No headers. No bullets. 2 sentences max unless the question demands more."
+                        )
+                        example = {
+                            "messages": [
+                                {"role": "system", "content": persona_sys},
+                                {"role": "user", "content": preceding_human.content},
+                                {"role": "assistant", "content": agent_msg.content},
+                            ],
+                            "metadata": {
+                                **meta_base,
+                                "agent_name": agent_name,
+                                "example_type": "persona_sft",
+                            },
+                        }
+                        f.write(json.dumps(example, ensure_ascii=False) + "\n")
+
+            # ── FILE 3: Self-model evolution (DPO/preference dataset) ────────────
+            # Pairs of (earlier_self_model, later_self_model) per agent — later is preferred.
+            # Also exports each self_model as a standalone record for single-turn SFT.
+            self_model_file = _EXPORT_DIR / "agent_self_model_evolution.jsonl"
+            with open(self_model_file, "a", encoding="utf-8") as f:
+                agent_self_models: dict[str, list] = {}
+                for msg in messages:
+                    if msg.role == "agent" and msg.agent:
+                        # Collect all unique self-model-style messages (short, pattern-like)
+                        content = msg.content.strip()
+                        if len(content.split()) <= 50:  # short = likely a pattern/self-insight
+                            agent_self_models.setdefault(msg.agent.name, []).append(content)
+
+                # Export per-agent pattern as a standalone record
+                for agent_name, patterns in agent_self_models.items():
+                    if not patterns:
+                        continue
+                    record = {
+                        "agent_name": agent_name,
+                        "council_topic": council.topic,
+                        "council_title": council.title,
+                        "observed_patterns": patterns,
+                        "record_type": "agent_pattern_observation",
+                        "metadata": {**meta_base},
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            logger.info(
+                "Training export complete for council %s: %d conversation turns, %d agents",
+                council.id, len(conversation), len(agent_msgs),
+            )
 
         except Exception as exc:
             logger.warning("Training export failed: %s", exc)

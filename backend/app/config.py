@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+    # Search providers (for agent tool: web_search)
+    # Priority: Tavily > Brave > DuckDuckGo (free fallback, no key needed)
+    tavily_api_key: str = ""          # https://tavily.com — best quality
+    brave_search_api_key: str = ""    # https://api.search.brave.com
+
     # Model defaults
     default_model: str = "gemma3:latest"
     synthesis_model: str = "claude-sonnet-4-6"

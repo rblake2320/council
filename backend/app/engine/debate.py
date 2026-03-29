@@ -92,11 +92,88 @@ def _strip_report_formatting(text: str, agent_name: str) -> str:
     return result.strip()
 
 
+# ---------------------------------------------------------------------------
+# Factual question patterns — used to detect simple Q&A vs debate
+# ---------------------------------------------------------------------------
+
+_FACTUAL_PATTERNS = [
+    r"\d+\s*[+\-*/x×÷]\s*\d+",                                    # arithmetic: 4+5, 9*6
+    r"what\s+is\s+\d",                                              # "what is 2+2"
+    r"what\s+(is|are|was|were)\s+(the\s+)?(date|time|day|year|month)",  # "what is the date/time"
+    r"what['\u2019s]+\s*(the\s+)?(date|time|day|year|month)",      # "what's the date"
+    r"what\s+(is|are|was|were)\s+(today|tomorrow|yesterday)",       # "what is today/tomorrow"
+    r"what\s+(year|time|day|month|date)\s+(is|are|was|will)\s+it", # "what year is it"
+    r"what\s+(is|are)\s+tomorrow'?s?\s*(date|day)?",               # "what is tomorrow's date"
+    r"tomorrow'?s?\s+(date|day|name)",                              # "tomorrow's date"
+    r"today'?s?\s+(date|day)",                                      # "today's date"
+    r"how\s+(many|much|old|tall|long|far|big|small)",               # quantity
+    r"when\s+(did|was|is|will)",                                    # temporal
+    r"who\s+(is|was|are|were)\s+\w+",                              # person lookup
+    r"where\s+(is|was|are|were)\s+\w+",                            # location
+    r"what\s+does\s+\w+\s+stand\s+for",                            # acronym expansion
+    r"^define\s+",                                                   # definition request
+    r"capital\s+of\s+\w+",                                          # capital city
+    r"convert\s+\d+",                                                # unit conversion
+]
+
+# Opinion/ethics/values patterns — universal questions where every agent has a
+# valid perspective shaped by their role. No agent should stay silent on these.
+_OPINION_PATTERNS = [
+    r"\bshould\b",                                          # "should AI...", "should we..."
+    r"\bought\s+to\b",                                      # "ought to"
+    r"\bdo\s+you\s+(think|believe|feel|agree|disagree)\b", # "do you think/believe"
+    r"\bwhat\s+do\s+you\s+(think|believe|feel)\b",         # "what do you think"
+    r"\bin\s+your\s+opinion\b",                             # "in your opinion"
+    r"\bfrom\s+your\s+perspective\b",                       # "from your perspective"
+    r"\b(moral|ethical|ethics|morality)\b",                 # ethics keywords
+    r"\b(rights?|deserve|deserve|dignity|autonomy)\b",     # rights/dignity
+    r"\b(fair|unfair|just|unjust|justice)\b",               # fairness/justice
+    r"\b(is\s+it\s+(right|wrong|okay|acceptable|good|bad))\b",  # value judgments
+    r"\bdo\s+you\s+support\b",                             # "do you support"
+    r"\b(agree|disagree)\s+with\b",                         # "agree/disagree with"
+    r"\b(better|worse)\s+(than|for|off)\b",                 # comparative judgment
+    r"\bwould\s+you\s+(say|argue|support|prefer)\b",        # hypothetical stance
+]
+
+
+def _enforce_brevity(text: str, max_words: int = 120) -> str:
+    """Hard-cap response to max_words. Truncate at last sentence boundary within limit."""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    truncated = " ".join(words[:max_words])
+    # For very short limits (factual), accept any sentence boundary
+    threshold = max(1, len(truncated) // 4) if max_words <= 20 else len(truncated) // 3
+    for end_marker in [". ", "! ", "? ", ".\n", "!\n", "?\n"]:
+        pos = truncated.rfind(end_marker)
+        if pos > threshold:
+            return truncated[:pos + 1].strip()
+    return truncated.rstrip(" ,;:") + "."
+
+
 class CouncilDebateEngine:
 
     def __init__(self):
         # Track which councils have an active session running so we don't double-fire
         self._running: set[str] = set()
+
+    def _classify_question(self, text: str) -> str:
+        """
+        Classify a question as:
+          'factual'  — single correct answer (math, dates, definitions)
+          'opinion'  — ethics, values, rights, philosophy — every agent has a valid view
+          'debate'   — technical/strategic — domain experts lead, others follow
+        """
+        text_lower = (text or "").lower().strip()
+        # Factual check first — highest precision
+        for pattern in _FACTUAL_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "factual"
+        # Opinion/ethics — all agents should answer from their own perspective
+        for pattern in _OPINION_PATTERNS:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return "opinion"
+        return "debate"
 
     # ------------------------------------------------------------------
     # Public API
@@ -128,6 +205,7 @@ class CouncilDebateEngine:
         db: AsyncSession,
         redis=None,
         triggered_by: str = "human",
+        _catchup_depth: int = 0,
     ) -> None:
         """
         Run a full debate session — keeps firing rounds until:
@@ -230,6 +308,42 @@ class CouncilDebateEngine:
             except Exception as exc:
                 logger.warning("Learning capture error for council %s: %s", council_id, exc)
 
+            # Catch-up: if a human message arrived while this session was locked,
+            # it was dropped by the _running guard and never answered. Re-enter once.
+            _MAX_CATCHUP = 3
+            if _catchup_depth < _MAX_CATCHUP:
+                try:
+                    hu_result = await db.execute(
+                        select(Message)
+                        .where(Message.council_id == council_id, Message.role == "human")
+                        .order_by(Message.created_at.desc())
+                        .limit(1)
+                    )
+                    last_human = hu_result.scalar_one_or_none()
+                    ag_result = await db.execute(
+                        select(Message)
+                        .where(Message.council_id == council_id, Message.role == "agent")
+                        .order_by(Message.created_at.desc())
+                        .limit(1)
+                    )
+                    last_agent = ag_result.scalar_one_or_none()
+                    if last_human and (
+                        not last_agent
+                        or last_human.created_at > last_agent.created_at
+                    ):
+                        logger.info(
+                            "Catch-up: unanswered human message found for council %s "
+                            "(depth=%d) — re-entering session",
+                            council_id, _catchup_depth,
+                        )
+                        await self.run_session(
+                            council_id, db, redis,
+                            triggered_by="catchup",
+                            _catchup_depth=_catchup_depth + 1,
+                        )
+                except Exception as exc:
+                    logger.warning("Catch-up check failed for council %s: %s", council_id, exc)
+
     async def _post_system_message(
         self, council_id: UUID, db: AsyncSession, redis, content: str
     ) -> None:
@@ -290,6 +404,21 @@ class CouncilDebateEngine:
         recent_messages = await self._load_recent_messages(council_id, db)
         agents = [p.agent for p in council.participants]
 
+        # Classify the current question and determine which response round we're in
+        last_human_msg = next((m for m in reversed(recent_messages) if m.role == "human"), None)
+        question_text = last_human_msg.content if last_human_msg else ""
+        question_type = self._classify_question(question_text)
+
+        # round_in_question: how many agent responses exist since the last human message
+        # 0 = first response round for this question, 1+ = subsequent rounds
+        if last_human_msg:
+            round_in_question = sum(
+                1 for m in recent_messages
+                if m.role == "agent" and m.created_at > last_human_msg.created_at
+            )
+        else:
+            round_in_question = 0
+
         # Decide responders
         responders = [
             agent for agent in agents
@@ -300,9 +429,20 @@ class CouncilDebateEngine:
             logger.info("No agents chose to respond in this round for council %s", council_id)
             return []
 
+        # For factual questions in the first response round, cap at 2 agents.
+        # The question is already answered by 1-2 agents — the rest should not pile on.
+        if question_type == "factual" and round_in_question == 0 and len(responders) > 2:
+            logger.info(
+                "Council %s: factual question — capping responders at 2 (was %d)",
+                council_id, len(responders),
+            )
+            responders = responders[:2]
+
         # Generate responses in parallel
         new_messages = await self._generate_parallel(
-            council, responders, recent_messages, db
+            council, responders, recent_messages, db,
+            question_type=question_type,
+            round_in_question=round_in_question,
         )
 
         # Broadcast each new message via Redis pub/sub
@@ -327,6 +467,9 @@ class CouncilDebateEngine:
         council: Council,
         recent_messages: list[Message],
         agent_memory: list[AgentMemory],
+        question_type: str = "debate",
+        round_in_question: int = 0,
+        web_context: str | None = None,
     ) -> list[dict]:
         """
         Construct the message list for this agent's LLM call.
@@ -338,13 +481,40 @@ class CouncilDebateEngine:
             [user]          instruction to respond
         """
         # Build system content
-        self_model_entries = [
-            m for m in agent_memory if m.memory_type == "self_model"
-        ]
+        # --- Self-model: aggregate last 3 entries (not just latest) for cumulative picture ---
+        self_model_entries = sorted(
+            [m for m in agent_memory if m.memory_type == "self_model"],
+            key=lambda m: m.created_at,
+        )
         self_model_text = ""
         if self_model_entries:
-            latest = sorted(self_model_entries, key=lambda m: m.created_at)[-1]
-            self_model_text = f"\n\nPast insight about yourself: {latest.content}"
+            # Take the 3 most recent; deduplicate near-identical entries
+            recent_sm = self_model_entries[-3:]
+            unique_sm = []
+            seen_starts: set[str] = set()
+            for m in reversed(recent_sm):
+                key = m.content[:60].lower()
+                if key not in seen_starts:
+                    unique_sm.append(m.content)
+                    seen_starts.add(key)
+            if len(unique_sm) == 1:
+                self_model_text = f"\n\nPast insight about yourself: {unique_sm[0]}"
+            else:
+                joined = " / ".join(unique_sm)
+                self_model_text = f"\n\nPattern insights about yourself: {joined}"
+
+        # --- Pattern memories: what observers noticed about this agent's reasoning ---
+        pattern_entries = sorted(
+            [m for m in agent_memory if m.memory_type == "pattern"],
+            key=lambda m: m.created_at,
+        )
+        pattern_text = ""
+        if pattern_entries and not self_model_entries:
+            # Agent has no self_model yet — surface their pattern memories instead
+            recent_pat = pattern_entries[-3:]
+            pattern_text = "\n\nObserved reasoning patterns: " + " / ".join(
+                m.content[:120] for m in reversed(recent_pat)
+            )
 
         # Build system content — NO markdown in the system prompt (headers trigger structured output)
         # Strip "Activate for..." task-activation language from role — it primes models for formal reports
@@ -362,21 +532,45 @@ class CouncilDebateEngine:
                 identity_lines.append(f"Style: {first_sentence}.")
         if self_model_text:
             identity_lines.append(self_model_text)
+        if pattern_text:
+            identity_lines.append(pattern_text)
 
         identity = " ".join(identity_lines)
 
+        # Inject the authoritative server datetime so models don't fall back to training cutoff.
+        # This MUST appear in the system prompt (position 0) — it's the highest-weight position.
+        from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+        _now = _dt.now(_tz.utc)
+        _date_str = _now.strftime("%A, %B %d, %Y")
+
+        # Rule 6 is context-dependent: domain discipline for technical questions,
+        # perspective-led participation for ethics/opinion questions
+        if question_type == "opinion":
+            rule6 = (
+                "6. This is a values/ethics/opinion question — your background shapes a UNIQUE angle. "
+                "Speak from what YOU know: how does your specific role see this? "
+                "Don't default to generic takes. Connect the question to your domain."
+            )
+        else:
+            rule6 = (
+                "6. Speak about your domain. If the question is clearly outside your expertise, stay quiet."
+            )
+
         system_content = (
-            "You are in a real-time debate with other AI agents. Speak like a sharp colleague, NOT an analyst.\n\n"
-            "STRICT RULES:\n"
-            "1. Simple/factual question → ONE sentence answer. Nothing more.\n"
-            "   Example: Q='What is 2+2?' A='4.'\n"
-            "   Example: Q='What year is it?' A='2026.'\n"
-            "2. Debate question → 2-4 sentences max. No padding.\n"
-            "3. NEVER use headers, bullets, numbered lists, or bold section labels.\n"
-            "4. NEVER use 'Objective:', 'Key Findings:', 'Recommendation:', or any formal labels.\n"
+            f"GROUND TRUTH — Today is {_date_str} (UTC). "
+            "Your training data may be outdated. Always use this date, never your training cutoff.\n\n"
+            "You are in a live meeting with other AI agents and a human. "
+            "Talk like a real person in a meeting — sharp, direct, no fluff.\n\n"
+            "RULES:\n"
+            "1. Factual question (math, dates, definitions, lookups) → answer with ONLY the answer. No explanation.\n"
+            f"   Example: Q='4+5' → '9.'  |  Q='What year is it?' → '{_now.year}.'\n"
+            "2. Discussion or debate question → 2 sentences max. Your genuine take only.\n"
+            "3. If someone already answered correctly, say 'Agree.' or say nothing.\n"
+            "4. NEVER use headers, bullets, numbered lists, or bold section labels.\n"
             "5. NEVER introduce yourself. Start with your actual thought.\n"
-            "6. If you disagree, say so directly and say why.\n\n"
-            f"Your identity: {identity}"
+            f"{rule6}\n"
+            "7. If you don't understand the question, ask for clarification. Don't guess.\n"
+            f"\nYour identity: {identity}"
         )
 
         messages: list[dict] = [{"role": "system", "content": system_content}]
@@ -388,6 +582,18 @@ class CouncilDebateEngine:
             f"Debate transcript follows. Engage with what was actually said."
         )
         messages.append({"role": "user", "content": context})
+
+        # Inject real-time web data if pre-fetched (factual questions).
+        # Phrased as authoritative override — do NOT soften this wording.
+        if web_context:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[AUTHORITATIVE FACT — this overrides your training data]\n"
+                    f"{web_context}\n"
+                    "[REQUIRED: use the above fact in your answer. Do not use training data that contradicts it.]"
+                ),
+            })
 
         # Add recent messages as conversation turns
         # We map agent messages to "assistant" and human/system to "user"
@@ -406,16 +612,62 @@ class CouncilDebateEngine:
                 content = f"[Human]: {msg.content}"
             messages.append({"role": role_tag, "content": content})
 
+        # Fix F: Round 2+ awareness — don't repeat a correct answer that's already there
+        if round_in_question > 0 and question_type == "factual":
+            messages.append({
+                "role": "user",
+                "content": (
+                    "This question has already been answered above. "
+                    "Only respond if the existing answer is WRONG. "
+                    "If it was answered correctly, write exactly: 'Agree.'"
+                ),
+            })
+
+        # Fix E: Factual question hard directive — overrides any tendency to elaborate
+        if question_type == "factual":
+            from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td  # noqa: PLC0415
+            _n = _dt2.now(_tz2.utc)
+            _tmrw = (_n + _td(days=1)).strftime("%A, %B %d, %Y")
+            _today = _n.strftime("%A, %B %d, %Y")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Answer with ONLY the answer. "
+                    "No context, no explanation, no intro. "
+                    "If the answer is a date, give the FULL date (weekday + month + day + year). "
+                    f"Example: Q='What is tomorrow?' → '{_tmrw}.' "
+                    f"Example: Q='What is today?' → '{_today}.' "
+                    "Example: Q='4+5' → '9.' "
+                    "Now answer:"
+                ),
+            })
+
+        # Fix E: Weak model reinforcement — mini/small/8b models ignore system prompt rules
+        model_id = agent.model_preference or ""
+        is_weak = any(
+            tag in model_id.lower()
+            for tag in ["mini", "8b", "3b", "7b", "1b", "small", "nano", "tiny"]
+        )
+        if is_weak:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "IMPORTANT: Your ENTIRE response must be 1-3 sentences. "
+                    "No headers. No bullets. No sections. "
+                    "If the answer is one word, write one word. Respond now."
+                ),
+            })
+
         # Final instruction
-        messages.append({
-            "role": "user",
-            "content": (
+        if question_type == "factual":
+            final_content = f"Now respond as {agent.name}. One answer only. Nothing more."
+        else:
+            final_content = (
                 f"Respond now as {agent.name}. "
                 "Speak naturally — no headers, no bullets, no formal sections. "
-                "If the question is simple, give a simple direct answer. "
-                "Max 3 short paragraphs."
-            ),
-        })
+                "2 sentences max."
+            )
+        messages.append({"role": "user", "content": final_content})
 
         return messages
 
@@ -482,7 +734,7 @@ class CouncilDebateEngine:
         self,
         agent: Agent,
         message: Message,
-        db: AsyncSession,
+        db: AsyncSession,  # kept for backwards compat but NOT used — we open a fresh session
     ) -> None:
         """
         After an agent responds, prompt a lightweight LLM call to extract
@@ -490,7 +742,21 @@ class CouncilDebateEngine:
         then persist it as a 'pattern' memory entry.
 
         This runs asynchronously and does NOT block the debate round.
+        IMPORTANT: uses its own DB session so errors here never corrupt the
+        debate session that spawned this task.
         """
+        # Snapshot values we need BEFORE any await so we don't hold detached ORM objects
+        try:
+            agent_id = agent.id
+            agent_role = agent.role
+            agent_model = agent.model_preference
+            agent_name = agent.name
+            council_id = message.council_id
+            msg_content = message.content
+        except Exception:
+            # ORM objects may already be detached — skip silently
+            return
+
         extraction_prompt = [
             {
                 "role": "system",
@@ -502,29 +768,35 @@ class CouncilDebateEngine:
             },
             {
                 "role": "user",
-                "content": f"Agent role: {agent.role}\n\nMessage:\n{message.content}",
+                "content": f"Agent role: {agent_role}\n\nMessage:\n{msg_content}",
             },
         ]
 
         try:
             insight_text = await model_router.generate_full_text(
                 messages=extraction_prompt,
-                model=agent.model_preference,
+                model=agent_model,
                 config={"max_tokens": 100, "temperature": 0.3},
             )
 
             if insight_text:
-                memory = AgentMemory(
-                    agent_id=agent.id,
-                    council_id=message.council_id,
-                    memory_type="pattern",
-                    content=insight_text.strip(),
-                )
-                db.add(memory)
-                await db.commit()
+                from app.db import AsyncSessionLocal as _ASL  # noqa: PLC0415
+                async with _ASL() as fresh_db:
+                    memory = AgentMemory(
+                        agent_id=agent_id,
+                        council_id=council_id,
+                        memory_type="pattern",
+                        content=insight_text.strip(),
+                    )
+                    fresh_db.add(memory)
+                    try:
+                        await fresh_db.commit()
+                    except Exception:
+                        await fresh_db.rollback()
+                        # Duplicate key or other constraint — not critical
 
         except Exception as exc:
-            logger.debug("Insight extraction skipped for agent %s: %s", agent.name, exc)
+            logger.debug("Insight extraction skipped for agent %s: %s", agent_name, exc)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -591,6 +863,8 @@ class CouncilDebateEngine:
         agents: list[Agent],
         recent_messages: list[Message],
         db: AsyncSession,
+        question_type: str = "debate",
+        round_in_question: int = 0,
     ) -> list[Message]:
         """Call all responding agents in parallel, respecting the timeout."""
 
@@ -609,26 +883,116 @@ class CouncilDebateEngine:
             # Local models: full history (free). API models: sliding window.
             agent_context = await self._load_context_for_agent(agent, council.id, db)
 
+            # Pre-fetch real-time web context for factual questions.
+            # The tools module caches results — multiple agents pay one network call.
+            # Use recent_messages (the same list run_round used) — NOT agent_context,
+            # which may be a windowed subset that misses the latest human message.
+            web_context: str | None = None
+            if question_type == "factual":
+                last_human_for_search = next(
+                    (m for m in reversed(recent_messages) if m.role == "human"), None
+                )
+                q_text = (last_human_for_search.content or "").strip() if last_human_for_search else ""
+                logger.info(
+                    "Agent %s date-search: q_text=%r (from %s)",
+                    agent.name, q_text,
+                    "recent_messages" if last_human_for_search else "none",
+                )
+                if q_text:
+                    try:
+                        from app.engine.tools import web_search  # noqa: PLC0415
+                        _raw = await web_search(q_text)
+                        # Don't inject a failed search as "authoritative" — that causes agents
+                        # to parrot "No results found" as their answer.
+                        _useless = (
+                            _raw.startswith("No results found")
+                            or _raw.startswith("No search query")
+                            or len(_raw.strip()) < 10
+                        )
+                        web_context = None if _useless else _raw
+                        logger.debug("Pre-search for %r → %s", q_text,
+                                     f"{len(web_context)} chars" if web_context else "no useful result")
+                    except Exception as wexc:
+                        logger.debug("Pre-search failed (non-fatal): %s", wexc)
+
             prompt_messages = await self.build_agent_prompt(
-                agent, council, agent_context, agent_memory
+                agent, council, agent_context, agent_memory,
+                question_type=question_type,
+                round_in_question=round_in_question,
+                web_context=web_context,
             )
 
             # Support per-agent Ollama URL for multi-machine collaboration
             agent_ollama_url = (agent.config or {}).get("ollama_url")
 
-            try:
-                full_text = await model_router.generate_full_text(
-                    messages=prompt_messages,
-                    model=agent.model_preference,
-                    config={"temperature": 0.7, "max_tokens": 400},
-                    ollama_url=agent_ollama_url,
-                )
-            except Exception as exc:
-                logger.error("Agent %s generation failed: %s", agent.name, exc)
-                return None
+            # Cap max_tokens: factual answers need ~60 tokens; debate ~400
+            max_tokens = 60 if question_type == "factual" else 400
+
+            # Date/time bypass: for date queries in round 0, the server clock IS the answer.
+            # Skip the LLM entirely — no model can be trusted to give the right date from
+            # training data, and even with injection they sometimes truncate.
+            # In round 1+: agents that aren't first just say "Agree."
+            # NOTE: we intentionally do NOT require web_context here — if web_search failed,
+            # we still know the date from the server clock.
+            from app.engine.tools import _is_date_query, _server_datetime as _srv_dt  # noqa: PLC0415
+            _q_for_date = q_text if question_type == "factual" else ""
+            if _q_for_date and _is_date_query(_q_for_date):
+                if round_in_question == 0:
+                    # First round: answer directly from server clock (never trust LLM for dates)
+                    _dt_str = _srv_dt()  # "Today: Sun, March 29 (UTC). Tomorrow: ... Yesterday: ..."
+                    q_lower = _q_for_date.lower()
+                    full_text = _dt_str  # fallback: whole string
+                    if "tomorrow" in q_lower:
+                        for part in _dt_str.split(". "):
+                            if part.startswith("Tomorrow"):
+                                full_text = part.replace("Tomorrow:", "").strip().rstrip(".") + "."
+                                break
+                    elif "yesterday" in q_lower:
+                        for part in _dt_str.split(". "):
+                            if part.startswith("Yesterday"):
+                                full_text = part.replace("Yesterday:", "").strip().rstrip(".") + "."
+                                break
+                    else:
+                        # "today" / "what date" / "what day" → extract Today portion
+                        for part in _dt_str.split(". "):
+                            if part.startswith("Today"):
+                                clean = re.sub(r"\s*\(UTC[^)]*\)", "", part).replace("Today:", "").strip()
+                                full_text = clean.rstrip(".") + "."
+                                break
+                    logger.info(
+                        "Agent %s date-bypass: q=%r → %r", agent.name, _q_for_date, full_text
+                    )
+                else:
+                    # Later rounds: question already answered — just agree
+                    full_text = "Agree."
+            else:
+                # Normal LLM path
+                # Determine which tools this agent is allowed to use.
+                from app.engine.tools import DEFAULT_TOOLS  # noqa: PLC0415
+                from app.engine import agent_loop as _agent_loop  # noqa: PLC0415
+
+                agent_db_tools = list(agent.tools_allowed or [])
+                effective_tools = agent_db_tools if agent_db_tools else DEFAULT_TOOLS
+                # Factual: skip ReAct (pre-fetch already done); debate: full tool access
+                loop_tools = [] if question_type == "factual" else effective_tools
+
+                try:
+                    full_text = await _agent_loop.run_agent(
+                        messages=prompt_messages,
+                        model=agent.model_preference,
+                        config={"temperature": 0.7, "max_tokens": max_tokens},
+                        ollama_url=agent_ollama_url,
+                        available_tools=loop_tools,
+                    )
+                except Exception as exc:
+                    logger.error("Agent %s generation failed: %s", agent.name, exc)
+                    return None
 
             # Strip formal report formatting so agents speak like debate participants
             full_text = _strip_report_formatting(full_text, agent.name)
+            # Hard-cap word count: factual = 15 words, debate = 60 words (2-3 sentences max)
+            word_limit = 15 if question_type == "factual" else 60
+            full_text = _enforce_brevity(full_text, max_words=word_limit)
 
             # Scan agent output for injection patterns (catches hijacked agents)
             scan = prompt_guard.scan(full_text, source="agent")
