@@ -352,8 +352,6 @@ const CONSOLE_BRIDGE_SCRIPT = `<script>
 /** Combine HTML + CSS + JS files into a single renderable document */
 export function buildPreviewDoc(files: WorkspaceFile[]): string {
   const html = files.find(f => f.name === 'index.html');
-  const css = files.find(f => f.name === 'style.css');
-  const js = files.find(f => f.name === 'script.js');
 
   if (!html) {
     // If no index.html, render whatever the active file is
@@ -367,21 +365,28 @@ export function buildPreviewDoc(files: WorkspaceFile[]): string {
 
   let doc = html.content;
 
-  // Inline the CSS (replace <link rel="stylesheet" href="style.css"> with a <style> block)
-  if (css) {
-    doc = doc.replace(
-      /<link[^>]*rel=["']stylesheet["'][^>]*href=["']style\.css["'][^>]*\/?>/gi,
-      `<style>${css.content}</style>`,
-    );
-  }
+  // Inline every CSS file referenced via <link rel="stylesheet" href="filename.css">
+  // Handles any filename — style.css, styles.css, app.css, theme.css, etc.
+  doc = doc.replace(
+    /<link[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+\.css)["'][^>]*\/?>/gi,
+    (_match, href) => {
+      const cssFile = files.find(f => f.name === href);
+      return cssFile ? `<style>${cssFile.content}</style>` : _match;
+    },
+  );
 
-  // Inline the JS (replace <script src="script.js"> with a <script> block)
-  if (js) {
-    doc = doc.replace(
-      /<script[^>]*src=["']script\.js["'][^>]*><\/script>/gi,
-      `<script>${js.content}<\/script>`,
-    );
-  }
+  // Inline every local JS file referenced via <script src="filename.js">
+  // Handles any filename — script.js, app.js, game.js, scene.js, charts.js, dashboard.js, etc.
+  // Does NOT inline CDN scripts (http/https URLs are left untouched).
+  doc = doc.replace(
+    /<script([^>]*)src=["'](?!https?:\/\/)([^"']+\.js)["']([^>]*)><\/script>/gi,
+    (_match, pre, src, post) => {
+      const jsFile = files.find(f => f.name === src);
+      // Preserve any attributes (e.g. type="text/babel") other than src
+      const attrs = (pre + post).trim();
+      return jsFile ? `<script${attrs ? ' ' + attrs : ''}>${jsFile.content}<\/script>` : _match;
+    },
+  );
 
   // Inject console bridge before </head>
   doc = doc.replace(/<\/head>/i, CONSOLE_BRIDGE_SCRIPT + '</head>');

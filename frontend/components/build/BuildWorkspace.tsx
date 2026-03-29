@@ -13,6 +13,14 @@
  * Console panel captures output from the sandboxed iframe via postMessage.
  * The iframe injects a console bridge script (see buildPreviewDoc in defaultFiles.ts)
  * that intercepts console.log/warn/error and window runtime errors.
+ *
+ * Added features:
+ *   - File rename via double-click (Enter=confirm, Escape=cancel)
+ *   - File upload from disk (multiple files, overwrites on name collision)
+ *   - ZIP export of all files (fflate, with per-file fallback)
+ *   - GitHub import modal
+ *   - Template chooser modal
+ *   - Secrets panel (env-var injection into preview iframe)
  */
 
 import * as React from 'react';
@@ -35,12 +43,19 @@ import {
   ChevronUp,
   X,
   GitMerge,
+  Upload,
+  GitBranch,
+  LayoutTemplate,
+  Lock,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { CodePatch, PendingPatch } from '@/lib/types';
 import { useCouncilStore } from '@/lib/stores';
 import type { WorkspaceFile } from './defaultFiles';
 import { DEFAULT_FILES, buildPreviewDoc, getLanguage } from './defaultFiles';
+import { GitHubImportModal } from './GitHubImportModal';
+import { TemplateChooserModal } from './TemplateChooserModal';
+import { SecretsPanel, buildSecretsScript } from './SecretsPanel';
 
 // --- Lazy Monaco (client-only) ---
 const MonacoEditor = dynamic(
@@ -446,16 +461,36 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
   // Key = filename, value = timestamp when the green flash should END (Date.now() + 1500ms)
   const [flashFiles, setFlashFiles] = React.useState<Record<string, number>>({});
 
+  // File rename state
+  const [renamingFile, setRenamingFile] = React.useState<string | null>(null);
+  const [renameValue, setRenameValue] = React.useState('');
+
+  // File upload ref
+  const fileUploadRef = React.useRef<HTMLInputElement>(null);
+
+  // Modal visibility state
+  const [showGithubImport, setShowGithubImport] = React.useState(false);
+  const [showTemplates, setShowTemplates] = React.useState(false);
+  const [showSecrets, setShowSecrets] = React.useState(false);
+
+  // Secrets state
+  const [secrets, setSecrets] = React.useState<Record<string, string>>({});
+
   const pendingPatches = useCouncilStore((s) => s.pendingPatches);
   const addPendingPatch = useCouncilStore((s) => s.addPendingPatch);
   const acceptPatch = useCouncilStore((s) => s.acceptPatch);
   const rejectPatch = useCouncilStore((s) => s.rejectPatch);
 
-  // Build preview doc whenever files change
+  // Build preview doc whenever files or secrets change
   React.useEffect(() => {
-    const doc = buildPreviewDoc(files);
+    let doc = buildPreviewDoc(files);
+    if (Object.keys(secrets).length > 0) {
+      const script = buildSecretsScript(secrets);
+      // Inject right after <head> so secrets are available to all scripts
+      doc = doc.replace('<head>', '<head>' + script);
+    }
     setPreviewDoc(doc);
-  }, [files]);
+  }, [files, secrets]);
 
   // Auto-refresh the preview when doc changes
   React.useEffect(() => {
@@ -597,18 +632,114 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
     });
   }
 
-  function handleDownload() {
-    const blob = new Blob([previewDoc], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'pawpal-landing.html';
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
   function handleRunPreview() {
     setPreviewKey((k) => k + 1);
+  }
+
+  // --- File rename handlers -------------------------------------------------
+
+  function commitRename() {
+    if (!renamingFile) return;
+    const newName = renameValue.trim();
+
+    // Validation: not empty, no slashes, no duplicates (ignoring the file itself)
+    if (
+      !newName ||
+      newName.includes('/') ||
+      newName.includes('\\') ||
+      (newName !== renamingFile && files.some((f) => f.name === newName))
+    ) {
+      setRenamingFile(null);
+      setRenameValue('');
+      return;
+    }
+
+    if (newName !== renamingFile) {
+      setFiles((prev) =>
+        prev.map((f) =>
+          f.name === renamingFile
+            ? { ...f, name: newName, language: getLanguage(newName) }
+            : f,
+        ),
+      );
+      if (activeFile === renamingFile) setActiveFile(newName);
+    }
+
+    setRenamingFile(null);
+    setRenameValue('');
+  }
+
+  function handleRenameKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitRename();
+    } else if (e.key === 'Escape') {
+      setRenamingFile(null);
+      setRenameValue('');
+    }
+  }
+
+  // --- File upload from disk ------------------------------------------------
+
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const uploaded = e.target.files;
+    if (!uploaded) return;
+    const newFiles: WorkspaceFile[] = [];
+    for (const file of Array.from(uploaded)) {
+      const content = await file.text();
+      newFiles.push({ name: file.name, language: getLanguage(file.name), content });
+    }
+    setFiles((prev) => {
+      const merged = [...prev];
+      for (const f of newFiles) {
+        const idx = merged.findIndex((x) => x.name === f.name);
+        if (idx >= 0) merged[idx] = f; // overwrite on name collision
+        else merged.push(f);
+      }
+      return merged;
+    });
+    if (newFiles.length > 0) setActiveFile(newFiles[0].name);
+    // Reset so the same file can be re-uploaded
+    e.target.value = '';
+  }
+
+  // --- ZIP download with fflate, per-file fallback -------------------------
+
+  async function handleDownloadZip() {
+    try {
+      const { zip } = await import('fflate');
+      const zipData: Record<string, Uint8Array> = {};
+      for (const file of files) {
+        zipData[file.name] = new TextEncoder().encode(file.content);
+      }
+      zip(zipData, (err, data) => {
+        if (err) {
+          handleDownloadFallback();
+          return;
+        }
+        const blob = new Blob([data as Uint8Array<ArrayBuffer>], { type: 'application/zip' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'project.zip';
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    } catch {
+      handleDownloadFallback();
+    }
+  }
+
+  function handleDownloadFallback() {
+    for (const file of files) {
+      const blob = new Blob([file.content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
   }
 
   // --- Patch accept / reject -----------------------------------------------
@@ -645,6 +776,19 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
   return (
     <div className="flex flex-col h-full bg-[#0d0f1d] text-[#E8E8F0] overflow-hidden">
 
+      {/*
+        Hidden file input — placed at the top level of the JSX, outside any
+        interactive container, so click propagation cannot interfere with it.
+      */}
+      <input
+        ref={fileUploadRef}
+        type="file"
+        multiple
+        accept=".html,.css,.js,.ts,.tsx,.jsx,.json,.md,.txt,.yaml,.yml,.py,.sh"
+        className="hidden"
+        onChange={handleFileUpload}
+      />
+
       {/* ── Pending patch banners ─────────────────────────────── */}
       {pendingPatches.length > 0 && (
         <div className="flex flex-col gap-1.5 px-3 py-2 border-b border-[#1E2240] bg-[#0d0f1d] shrink-0">
@@ -668,19 +812,32 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
         {/* Header */}
         <div className="flex items-center justify-between px-3 py-2.5 border-b border-[#1E2240]">
           <span className="text-[10px] font-semibold text-[#8B90B8] uppercase tracking-wider">Files</span>
-          <button
-            onClick={() => setShowNewFile(true)}
-            className="p-0.5 rounded hover:bg-[#1E2240] text-[#8B90B8] hover:text-[#E8E8F0] transition"
-            title="New file"
-          >
-            <Plus size={12} />
-          </button>
+          <div className="flex items-center gap-1">
+            {/* Upload button */}
+            <button
+              onClick={() => fileUploadRef.current?.click()}
+              className="p-0.5 rounded hover:bg-[#1E2240] text-[#8B90B8] hover:text-[#E8E8F0] transition"
+              title="Upload files from disk"
+            >
+              <Upload size={12} />
+            </button>
+            {/* New file button */}
+            <button
+              onClick={() => setShowNewFile(true)}
+              className="p-0.5 rounded hover:bg-[#1E2240] text-[#8B90B8] hover:text-[#E8E8F0] transition"
+              title="New file"
+            >
+              <Plus size={12} />
+            </button>
+          </div>
         </div>
 
         {/* File list */}
         <div className="flex-1 overflow-y-auto py-1">
           {files.map((file) => {
             const isFlashing = (flashFiles[file.name] ?? 0) > Date.now();
+            const isRenaming = renamingFile === file.name;
+
             return (
               <div
                 key={file.name}
@@ -692,11 +849,37 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
                     ? 'bg-[#1E2240] text-[#E8E8F0]'
                     : 'text-[#8B90B8] hover:bg-[#161928] hover:text-[#E8E8F0]',
                 )}
-                onClick={() => setActiveFile(file.name)}
+                onClick={() => {
+                  if (!isRenaming) setActiveFile(file.name);
+                }}
               >
                 <FileIcon name={file.name} />
-                <span className="flex-1 truncate font-mono">{file.name}</span>
-                {files.length > 1 && (
+
+                {isRenaming ? (
+                  <input
+                    autoFocus
+                    className="flex-1 min-w-0 bg-[#0d0f1d] border border-[#7C6BF2] text-[#E8E8F0] text-xs rounded px-1 py-0.5 font-mono focus:outline-none"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onBlur={commitRename}
+                    onKeyDown={handleRenameKeyDown}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                ) : (
+                  <span
+                    className="flex-1 truncate font-mono"
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      setRenamingFile(file.name);
+                      setRenameValue(file.name);
+                    }}
+                    title="Double-click to rename"
+                  >
+                    {file.name}
+                  </span>
+                )}
+
+                {!isRenaming && files.length > 1 && (
                   <button
                     onClick={(e) => { e.stopPropagation(); handleDeleteFile(file.name); }}
                     className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-red-900/40 text-[#8B90B8] hover:text-[#F05A5A] transition"
@@ -713,10 +896,28 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
         {/* Bottom actions */}
         <div className="border-t border-[#1E2240] p-2 flex flex-col gap-1">
           <button
-            onClick={handleDownload}
+            onClick={handleDownloadZip}
             className="flex items-center gap-1.5 w-full px-2 py-1.5 text-xs text-[#8B90B8] hover:text-[#E8E8F0] hover:bg-[#1E2240] rounded transition"
           >
-            <Download size={11} /> Download
+            <Download size={11} /> Download ZIP
+          </button>
+          <button
+            onClick={() => setShowGithubImport(true)}
+            className="flex items-center gap-1.5 w-full px-2 py-1.5 text-xs text-[#8B90B8] hover:text-[#E8E8F0] hover:bg-[#1E2240] rounded transition"
+          >
+            <GitBranch size={11} /> Import from GitHub
+          </button>
+          <button
+            onClick={() => setShowTemplates(true)}
+            className="flex items-center gap-1.5 w-full px-2 py-1.5 text-xs text-[#8B90B8] hover:text-[#E8E8F0] hover:bg-[#1E2240] rounded transition"
+          >
+            <LayoutTemplate size={11} /> Templates
+          </button>
+          <button
+            onClick={() => setShowSecrets(true)}
+            className="flex items-center gap-1.5 w-full px-2 py-1.5 text-xs text-[#8B90B8] hover:text-[#E8E8F0] hover:bg-[#1E2240] rounded transition"
+          >
+            <Lock size={11} /> Secrets
           </button>
           <button
             onClick={() => {
@@ -878,10 +1079,43 @@ export function BuildWorkspace({ councilId, onRegisterPatchHandler }: BuildWorks
       </PanelGroup>{/* end editor+preview panels */}
       </div>{/* end editor row */}
 
+      {/* ── Modals ────────────────────────────────────────────── */}
+
       {showNewFile && (
         <NewFileModal
           onConfirm={handleNewFile}
           onClose={() => setShowNewFile(false)}
+        />
+      )}
+
+      {showGithubImport && (
+        <GitHubImportModal
+          onImport={(importedFiles) => {
+            setFiles(importedFiles);
+            setActiveFile(importedFiles[0]?.name ?? '');
+            setShowGithubImport(false);
+          }}
+          onClose={() => setShowGithubImport(false)}
+        />
+      )}
+
+      {showTemplates && (
+        <TemplateChooserModal
+          onSelect={(templateFiles) => {
+            setFiles(templateFiles);
+            setActiveFile(templateFiles[0]?.name ?? '');
+            setShowTemplates(false);
+          }}
+          onClose={() => setShowTemplates(false)}
+        />
+      )}
+
+      {showSecrets && (
+        <SecretsPanel
+          councilId={councilId}
+          onSecretsChange={setSecrets}
+          isOpen={showSecrets}
+          onClose={() => setShowSecrets(false)}
         />
       )}
     </div>
