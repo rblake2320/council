@@ -14,7 +14,7 @@ from app.engine.tools import (
     _CACHE,
     _cache_set,
     _cached,
-    _ddg_instant,
+    _ddg_search,
     _is_date_query,
     _server_datetime,
     run_cli,
@@ -140,7 +140,7 @@ class TestWebSearch:
         """With no Tavily/Brave keys, should fall through to DDG."""
         with patch("app.engine.tools._tavily_search", new_callable=AsyncMock) as mock_t, \
              patch("app.engine.tools._brave_search", new_callable=AsyncMock) as mock_b, \
-             patch("app.engine.tools._ddg_instant", new_callable=AsyncMock) as mock_d:
+             patch("app.engine.tools._ddg_search", new_callable=AsyncMock) as mock_d:
             mock_d.return_value = "DDG result for python asyncio"
             _CACHE.pop("s:python asyncio", None)
 
@@ -162,7 +162,7 @@ class TestWebSearch:
     async def test_tavily_used_when_key_present(self):
         """When TAVILY_API_KEY is set, Tavily should be tried first."""
         with patch("app.engine.tools._tavily_search", new_callable=AsyncMock) as mock_t, \
-             patch("app.engine.tools._ddg_instant", new_callable=AsyncMock) as mock_d:
+             patch("app.engine.tools._ddg_search", new_callable=AsyncMock) as mock_d:
             mock_t.return_value = "Tavily result"
             _CACHE.pop("s:test tavily query", None)
 
@@ -181,7 +181,7 @@ class TestWebSearch:
     @pytest.mark.asyncio
     async def test_falls_back_to_ddg_when_tavily_returns_none(self):
         with patch("app.engine.tools._tavily_search", new_callable=AsyncMock) as mock_t, \
-             patch("app.engine.tools._ddg_instant", new_callable=AsyncMock) as mock_d:
+             patch("app.engine.tools._ddg_search", new_callable=AsyncMock) as mock_d:
             mock_t.return_value = None
             mock_d.return_value = "DDG fallback"
             _CACHE.pop("s:fallback test query", None)
@@ -200,7 +200,7 @@ class TestWebSearch:
     async def test_no_results_message_when_all_fail(self):
         with patch("app.engine.tools._tavily_search", new_callable=AsyncMock) as mock_t, \
              patch("app.engine.tools._brave_search", new_callable=AsyncMock) as mock_b, \
-             patch("app.engine.tools._ddg_instant", new_callable=AsyncMock) as mock_d:
+             patch("app.engine.tools._ddg_search", new_callable=AsyncMock) as mock_d:
             mock_t.return_value = None
             mock_b.return_value = None
             mock_d.return_value = None

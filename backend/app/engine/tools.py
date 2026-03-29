@@ -101,40 +101,44 @@ def _server_datetime() -> str:
 
 
 # ---------------------------------------------------------------------------
-# DuckDuckGo Instant Answer (free, no key)
+# DuckDuckGo full text search (free, no key — uses duckduckgo_search library)
 # ---------------------------------------------------------------------------
-async def _ddg_instant(query: str) -> Optional[str]:
-    """DuckDuckGo Instant Answer API — best for math, definitions, quick facts."""
-    url = (
-        "https://api.duckduckgo.com/"
-        f"?q={quote_plus(query)}&format=json&no_html=1&skip_disambig=1"
-    )
+async def _ddg_search(query: str) -> Optional[str]:
+    """
+    Full DuckDuckGo text search using the duckduckgo_search library.
+    Returns top-3 result snippets. Runs the sync DDGS() call in a thread pool
+    so it doesn't block the event loop.
+    """
     try:
-        resp = await _get_http().get(url)
-        resp.raise_for_status()
-        data = resp.json()
+        from ddgs import DDGS  # noqa: PLC0415
 
-        # Calculator / instant answer (highest confidence)
-        if data.get("Answer"):
-            return str(data["Answer"])
+        def _sync_search() -> list[dict]:
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=4))
 
-        # Wikipedia abstract
-        if data.get("AbstractText"):
-            text = data["AbstractText"][:600]
-            src = data.get("AbstractURL", "")
-            return f"{text}\nSource: {src}" if src else text
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, _sync_search)
 
-        # Related topic snippets
-        topics = [
-            t["Text"] for t in data.get("RelatedTopics", [])[:3]
-            if isinstance(t, dict) and t.get("Text")
-        ]
-        if topics:
-            return "\n".join(topics)
+        if not results:
+            return None
+
+        parts = []
+        for r in results[:3]:
+            title = r.get("title", "")
+            body = (r.get("body") or r.get("snippet") or "")[:300]
+            href = r.get("href", "")
+            if title or body:
+                parts.append(f"{title}: {body} ({href})" if href else f"{title}: {body}")
+
+        return "\n".join(parts) if parts else None
 
     except Exception as exc:
-        logger.debug("DDG instant answer failed for %r: %s", query, exc)
-    return None
+        logger.debug("DDG search failed for %r: %s", query, exc)
+        return None
+
+
+# Backwards-compat alias (used in older tests and mocks)
+_ddg_instant = _ddg_search
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +239,7 @@ async def web_search(query: str) -> str:
         logger.debug("Premium search providers failed: %s", exc)
 
     if not result:
-        result = await _ddg_instant(query)
+        result = await _ddg_search(query)
 
     if not result:
         result = f"No results found for: {query!r}"
