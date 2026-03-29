@@ -177,6 +177,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
+    # If it's an HTTPException with a detail dict (our custom 404s), pass it through
+    from fastapi import HTTPException as _HTTPException  # noqa: PLC0415
+    if isinstance(exc, _HTTPException) and isinstance(exc.detail, dict):
+        return JSONResponse(status_code=404, content={"error": exc.detail})
+    # Otherwise it's a routing miss (route doesn't exist)
     return JSONResponse(
         status_code=404,
         content={

@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import generate_api_key, optional_api_key, require_api_key
 from app.db import get_db, AsyncSessionLocal
+from app.security.prompt_guard import log_security_event, prompt_guard
 from app.engine.debate import debate_engine
 from app.engine.synthesis import synthesis_engine
 from app.models.agent import Agent
@@ -257,11 +258,34 @@ async def post_message(
             detail={"code": "COUNCIL_NOT_ACTIVE", "message": f"Council status is '{council.status}'."},
         )
 
+    # Scan human input for prompt injection before accepting the message
+    content = body.content
+    if body.role == "human":
+        scan = prompt_guard.scan(body.content, source="human")
+        if scan.should_block:
+            # Use fresh session — request session gets rolled back on HTTPException
+            await _log_sec_event_bg(council_id, "human", body.content[:200], scan, "blocked")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "INJECTION_DETECTED",
+                    "severity": scan.severity,
+                    "message": "Message blocked: potential prompt injection detected.",
+                    "patterns": [m["pattern_id"] for m in scan.matches],
+                },
+            )
+        elif scan.should_flag:
+            content = scan.sanitized_content
+            background_tasks.add_task(
+                _log_sec_event_bg, council_id, "human",
+                body.content[:200], scan, "flagged_and_sanitized",
+            )
+
     msg = Message(
         council_id=council_id,
         agent_id=None,
         role=body.role,
-        content=body.content,
+        content=content,
         mentions=body.mentions,
         metadata_=body.metadata,
     )
@@ -286,6 +310,18 @@ async def post_message(
 
     out = _message_to_dict(msg, agent_name=None, agent_role=None)
     return make_response(data=out)
+
+
+async def _log_sec_event_bg(
+    council_id: UUID,
+    source: str,
+    excerpt: str,
+    scan_result,
+    action_taken: str,
+) -> None:
+    """Background helper — logs security event with a fresh DB session."""
+    async with AsyncSessionLocal() as sec_db:
+        await log_security_event(sec_db, council_id, source, excerpt, scan_result, action_taken)
 
 
 async def _broadcast_single_message(council_id: UUID, msg: Message, redis) -> None:
@@ -377,6 +413,88 @@ async def get_synthesis(
         )
     out = SynthesisOut.model_validate(synthesis)
     return make_response(data=out.model_dump())
+
+
+# ---------------------------------------------------------------------------
+# Knowledge base (learning capture output)
+# ---------------------------------------------------------------------------
+
+@router.get("/{council_id}/knowledge", response_model=dict, summary="Get council knowledge summary")
+async def get_council_knowledge(
+    council_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _key: Optional[dict] = Depends(optional_api_key),
+):
+    """
+    Return the structured knowledge summary extracted by LearningCapture after this council concluded.
+    Includes consensus, key insights, dissenting views, open questions, and recommendation.
+    Returns 404 if capture hasn't run yet.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+    await _load_council_or_404(council_id, db)
+    result = await db.execute(
+        text("SELECT id, council_id, topic, summary, created_at FROM council.knowledge_base WHERE council_id = :cid"),
+        {"cid": str(council_id)},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "NO_KNOWLEDGE",
+                "message": "No knowledge summary yet. Council may still be active or capture hasn't run.",
+            },
+        )
+    return make_response(data={
+        "id": str(row["id"]),
+        "council_id": str(row["council_id"]),
+        "topic": row["topic"],
+        "summary": row["summary"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Security events
+# ---------------------------------------------------------------------------
+
+@router.get("/{council_id}/security-events", response_model=dict, summary="Get security events for council")
+async def get_security_events(
+    council_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _key: Optional[dict] = Depends(optional_api_key),
+):
+    """
+    Return prompt injection events detected for this council.
+    Most recent first. Use limit to page through older events.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+    await _load_council_or_404(council_id, db)
+    result = await db.execute(
+        text("""
+            SELECT id, council_id, source, severity, patterns, content_excerpt, action_taken, created_at
+            FROM council.security_events
+            WHERE council_id = :cid
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """),
+        {"cid": str(council_id), "lim": limit},
+    )
+    rows = result.mappings().all()
+    data = [
+        {
+            "id": str(r["id"]),
+            "source": r["source"],
+            "severity": r["severity"],
+            "patterns": r["patterns"],
+            "content_excerpt": r["content_excerpt"],
+            "action_taken": r["action_taken"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+    return make_response(data=data, meta={"total": len(data)})
 
 
 # ---------------------------------------------------------------------------

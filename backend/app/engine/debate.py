@@ -25,6 +25,7 @@ from app.config import settings
 from app.engine.router import model_router
 from app.models.agent import Agent
 from app.models.council import AgentMemory, Council, Message, Participant
+from app.security.prompt_guard import log_security_event, prompt_guard
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,13 @@ class CouncilDebateEngine:
 
         finally:
             self._running.discard(key)
+            # Learning capture — extracts knowledge, updates agent self-models, exports JSONL
+            # Runs after every completed session (handles its own exceptions internally)
+            try:
+                from app.engine.learning import learning_capture  # noqa: PLC0415 — lazy import avoids circular
+                await learning_capture.capture_session(council_id, db)
+            except Exception as exc:
+                logger.warning("Learning capture error for council %s: %s", council_id, exc)
 
     async def _post_system_message(
         self, council_id: UUID, db: AsyncSession, redis, content: str
@@ -517,6 +525,30 @@ class CouncilDebateEngine:
             except Exception as exc:
                 logger.error("Agent %s generation failed: %s", agent.name, exc)
                 return None
+
+            # Scan agent output for injection patterns (catches hijacked agents)
+            scan = prompt_guard.scan(full_text, source="agent")
+            if scan.should_block:
+                logger.warning(
+                    "Agent %s output BLOCKED — injection detected: %s",
+                    agent.name, [m["pattern_id"] for m in scan.matches],
+                )
+                # Log in a separate session so it doesn't interfere with the debate session
+                from app.db import AsyncSessionLocal  # noqa: PLC0415
+                async def _log_agent_block():  # noqa: E306
+                    try:
+                        async with AsyncSessionLocal() as sec_db:
+                            await log_security_event(
+                                sec_db, council.id, f"agent:{agent.name}",
+                                full_text[:200], scan, "blocked_agent_output",
+                            )
+                    except Exception as log_exc:
+                        logger.debug("Security log failed: %s", log_exc)
+                asyncio.create_task(_log_agent_block())
+                return None
+            elif scan.should_flag:
+                logger.info("Agent %s output flagged (LOW) — sanitized", agent.name)
+                full_text = scan.sanitized_content
 
             latency_ms = int((time.monotonic() - start) * 1000)
 
