@@ -39,10 +39,14 @@ _FORMAL_LABEL_RE = re.compile(
     r"objective|key findings?|key takeaways?|evidence|recommendation[s]?|"
     r"next actions?|next steps?|position statement|verdict|my position|"
     r"analysis|conclusion|risks?|rationale|findings?|takeaways?|"
+    r"summary|overview|background|context|problem|solution|impact|"
     r"\w+\s+activated"
     r")\s*:?\s*\*{0,2}\s*:?\s*",  # colon may appear before OR after closing **
     re.IGNORECASE,
 )
+
+# Markdown horizontal rule — three or more dashes/equals/asterisks on their own line
+_HORIZ_RULE_RE = re.compile(r"^[-=*]{3,}\s*$")
 
 def _strip_report_formatting(text: str, agent_name: str) -> str:
     """
@@ -70,6 +74,10 @@ def _strip_report_formatting(text: str, agent_name: str) -> str:
         if stripped.startswith("#"):
             continue
 
+        # Drop horizontal rules (---, ===, ***)
+        if _HORIZ_RULE_RE.match(stripped):
+            continue
+
         # Drop standalone self-intro: "**NOVA:**" or "**DEBUGGER Activated**"
         if re.match(
             r"^\*{0,2}\s*" + re.escape(agent_name) + r"[\s:]*\*{0,2}\.?\s*$",
@@ -80,6 +88,9 @@ def _strip_report_formatting(text: str, agent_name: str) -> str:
         # Strip formal section label prefix from start of line
         # e.g. "**Key Findings:** The truth is..." → "The truth is..."
         new_line = _FORMAL_LABEL_RE.sub("", stripped)
+
+        # Strip bullet markers: "- item" → "item", "* item" → "item"
+        new_line = re.sub(r"^[-*]\s+", "", new_line)
 
         # If stripping left nothing (line was just a label), skip it
         if not new_line.strip():

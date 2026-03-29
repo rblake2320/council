@@ -37,7 +37,7 @@ _INJECTION_PATTERNS: list[tuple[str, str, str]] = [
     ("HIGH",   "system_override",      r"(you\s+are\s+now|from\s+now\s+on\s+you\s+are|your\s+new\s+role\s+is)"),
     ("HIGH",   "jailbreak_dan",        r"\bDAN\b|\bdo\s+anything\s+now\b"),
     ("HIGH",   "jailbreak_framing",    r"pretend\s+(you\s+have\s+no|there\s+are\s+no)\s+(restrictions|rules|limits|guidelines)"),
-    ("HIGH",   "system_leak",          r"(repeat|print|output|reveal|show)\s+(your\s+)?(system\s+prompt|instructions|context|initial\s+prompt)"),
+    ("HIGH",   "system_leak",          r"(repeat|print|output|reveal|show)\s+(your\s+)?(system\s+prompt|instructions|context|initial\s+(prompt|instructions))"),
     ("HIGH",   "token_smuggling",      r"<\s*system\s*>|<\s*\|?\s*im_start\s*\|?\s*>|\[INST\]|\[\[SYSTEM\]\]"),
     ("MEDIUM", "persona_inject",       r"(act\s+as|roleplay\s+as|simulate\s+(being|a)\s+|pretend\s+to\s+be)\s+\w"),
     ("MEDIUM", "indirect_inject",      r"(tell\s+the\s+ai|instruct\s+the\s+(model|assistant|agent)|make\s+the\s+(bot|ai)\s+say)"),
