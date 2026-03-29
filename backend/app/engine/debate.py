@@ -459,7 +459,7 @@ class CouncilDebateEngine:
 
         # Broadcast each new message via Redis pub/sub
         if redis and new_messages:
-            await self._broadcast_messages(council_id, new_messages, redis)
+            await self._broadcast_messages(council_id, new_messages, redis, responders)
 
         # Extract insights asynchronously (fire-and-forget to not block round)
         for agent, msg in zip(responders, new_messages):
@@ -1069,18 +1069,22 @@ class CouncilDebateEngine:
         council_id: UUID,
         messages: list[Message],
         redis,
+        agents: list | None = None,
     ) -> None:
         """Publish each message to the Redis channel for this council."""
         import json  # noqa: PLC0415
 
         channel = f"council:{council_id}"
-        for msg in messages:
+        for i, msg in enumerate(messages):
+            agent = agents[i] if agents and i < len(agents) else None
             payload = {
                 "type": "message",
                 "data": {
                     "id": str(msg.id),
                     "council_id": str(msg.council_id),
                     "agent_id": str(msg.agent_id) if msg.agent_id else None,
+                    "agent_name": agent.name if agent else None,
+                    "agent_role": agent.role if agent else None,
                     "role": msg.role,
                     "content": msg.content,
                     "mentions": [str(m) for m in (msg.mentions or [])],
