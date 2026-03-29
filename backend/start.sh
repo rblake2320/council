@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Start the Council backend
-# Usage: bash start.sh [--port 8600] [--reload]
+# Usage: bash start.sh [--port 8601] [--reload]
 set -euo pipefail
 
-PORT=${PORT:-8600}
+PORT=${PORT:-8601}
 RELOAD_FLAG=""
 
 while [[ $# -gt 0 ]]; do

@@ -25,6 +25,7 @@ import html as html_lib
 import json
 import logging
 import operator
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -420,6 +421,69 @@ async def http_call(spec: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Public tool: rag_search — search the Ultra RAG IMDS corpus
+# ---------------------------------------------------------------------------
+_RAG_URL = os.environ.get("ULTRA_RAG_URL", "http://192.168.12.132:8300")
+_RAG_FALLBACK_URL = "https://api.ultrarag.app"
+
+
+async def rag_search(query: str, collection: str = "imds", top_k: int = 5) -> str:
+    """
+    Search the Ultra RAG knowledge base (IMDS corpus and more).
+    Returns top-k relevant chunks from the specified collection.
+
+    Collections: imds (4,015 Air Force IMDS maintenance doc chunks), personal
+    Usage: rag_search("AFTO Form 349 completion requirements")
+    """
+    query = (query or "").strip()
+    if not query:
+        return "No search query provided."
+
+    cache_key = f"rag:{collection}:{query}"
+    cached = _cached(cache_key)
+    if cached:
+        return cached
+
+    payload = {"query": query, "collection": collection, "top_k": top_k}
+
+    async def _do_search(base_url: str) -> str:
+        resp = await _get_http().post(f"{base_url}/api/search", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", data.get("chunks", []))
+        if not results:
+            return f"No results found in {collection} corpus for: {query!r}"
+        parts = []
+        for i, r in enumerate(results[:top_k], 1):
+            content = r.get("content", r.get("text", ""))[:500]
+            source = r.get("source", r.get("metadata", {}).get("source", ""))
+            score = r.get("score", r.get("similarity", ""))
+            score_str = f" (score: {score:.3f})" if isinstance(score, float) else ""
+            source_str = f"\n  Source: {source}" if source else ""
+            parts.append(f"[{i}] {content}{source_str}{score_str}")
+        return (
+            f"Ultra RAG — {collection} corpus ({len(results)} results):\n\n"
+            + "\n\n".join(parts)
+        )
+
+    try:
+        result = await _do_search(_RAG_URL)
+        _cache_set(cache_key, result)
+        return result
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        logger.debug("rag_search: direct Spark-1 unreachable, trying public tunnel")
+        try:
+            result = await _do_search(_RAG_FALLBACK_URL)
+            _cache_set(cache_key, result)
+            return result
+        except Exception as exc2:
+            return f"RAG search unavailable (both direct and tunnel failed): {exc2}"
+    except Exception as exc:
+        logger.warning("rag_search failed for %r: %s", query, exc)
+        return f"RAG search failed: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Public tool: run_cli (opt-in, allowlisted read-only commands)
 # ---------------------------------------------------------------------------
 _CLI_ALLOWLIST = frozenset([
@@ -498,9 +562,10 @@ TOOL_FUNCTIONS: dict[str, Callable] = {
     "web_fetch": web_fetch,
     "calculate": calculate,
     "http_call": http_call,
+    "rag_search": rag_search,
     "run_cli": run_cli,
 }
 
 # Default tools given to every agent
 # run_cli is still opt-in (requires explicit tools_allowed entry on the Agent DB row)
-DEFAULT_TOOLS: list[str] = ["web_search", "web_fetch", "calculate", "http_call"]
+DEFAULT_TOOLS: list[str] = ["web_search", "web_fetch", "calculate", "http_call", "rag_search"]
