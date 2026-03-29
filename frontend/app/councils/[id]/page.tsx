@@ -184,6 +184,29 @@ function DebateContent() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
 
+  // Polling fallback — activates when SSE is disconnected (Redis unavailable or proxy issues).
+  // Polls every 3 s and appends any new messages that arrived since the last known message.
+  React.useEffect(() => {
+    if (sseConnected || !council) return;
+
+    let lastSeenId: string | undefined = messages[messages.length - 1]?.id;
+
+    const timer = setInterval(async () => {
+      try {
+        const newMsgs = await getMessages(params.id, { limit: 20, after: lastSeenId });
+        for (const m of newMsgs) {
+          appendMessage(m);
+          lastSeenId = m.id;
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 3_000);
+
+    return () => clearInterval(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sseConnected, council?.id]);
+
   React.useEffect(() => {
     if (council?.synthesis_id && !synthesis) {
       getSynthesis(params.id).then(setSynthesis).catch(() => {});

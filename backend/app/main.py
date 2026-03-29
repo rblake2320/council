@@ -1,5 +1,5 @@
 """
-Council — Collaborative AI Agent Platform
+Council — Collaborative AI Agent Platform v1.0.1
 FastAPI application entry point.
 
 Mounts:

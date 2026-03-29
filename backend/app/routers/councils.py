@@ -281,12 +281,35 @@ async def post_message(
                 body.content[:200], scan, "flagged_and_sanitized",
             )
 
+    # Auto-parse @AgentName mentions from content if not explicitly provided
+    parsed_mentions = list(body.mentions or [])
+    if body.role == "human" and not parsed_mentions:
+        import re as _re  # noqa: PLC0415
+        from app.models.agent import Agent as _Agent  # noqa: PLC0415
+        from sqlalchemy import select as _select  # noqa: PLC0415
+        # Find all @Name patterns in the message
+        at_names = _re.findall(r"@(\w+)", content)
+        if at_names:
+            # Load council participants to match by name
+            from app.models.council import Participant as _Participant  # noqa: PLC0415
+            from sqlalchemy.orm import selectinload as _selectinload  # noqa: PLC0415
+            part_result = await db.execute(
+                _select(_Agent)
+                .join(_Participant, _Agent.id == _Participant.agent_id)
+                .where(_Participant.council_id == council_id)
+            )
+            participants = {a.name.lower(): a.id for a in part_result.scalars().all()}
+            for name in at_names:
+                agent_id_match = participants.get(name.lower())
+                if agent_id_match and agent_id_match not in parsed_mentions:
+                    parsed_mentions.append(agent_id_match)
+
     msg = Message(
         council_id=council_id,
         agent_id=None,
         role=body.role,
         content=content,
-        mentions=body.mentions,
+        mentions=parsed_mentions,
         metadata_=body.metadata,
     )
     db.add(msg)

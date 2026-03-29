@@ -13,6 +13,7 @@ Design principles:
 """
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from uuid import UUID
@@ -28,6 +29,67 @@ from app.models.council import AgentMemory, Council, Message, Participant
 from app.security.prompt_guard import log_security_event, prompt_guard
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Response post-processor — strips formal report formatting from debate output
+# ---------------------------------------------------------------------------
+
+_FORMAL_LABEL_RE = re.compile(
+    r"^\*{0,2}\s*("
+    r"objective|key findings?|key takeaways?|evidence|recommendation[s]?|"
+    r"next actions?|next steps?|position statement|verdict|my position|"
+    r"analysis|conclusion|risks?|rationale|findings?|takeaways?|"
+    r"\w+\s+activated"
+    r")\s*:?\s*\*{0,2}\s*:?\s*",  # colon may appear before OR after closing **
+    re.IGNORECASE,
+)
+
+def _strip_report_formatting(text: str, agent_name: str) -> str:
+    """
+    Remove formal-report patterns from debate responses.
+    - Strips markdown headers (lines starting with #)
+    - Strips bold section labels like **Key Findings:** from start of lines
+    - Strips standalone agent self-intro like **NOVA:** or DEBUGGER Activated
+    """
+    lines = text.split("\n")
+    cleaned = []
+    in_code_block = False
+    for line in lines:
+        stripped = line.strip()
+
+        # Track code blocks (never touch content inside them)
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            cleaned.append(line)
+            continue
+        if in_code_block:
+            cleaned.append(line)
+            continue
+
+        # Drop markdown headers
+        if stripped.startswith("#"):
+            continue
+
+        # Drop standalone self-intro: "**NOVA:**" or "**DEBUGGER Activated**"
+        if re.match(
+            r"^\*{0,2}\s*" + re.escape(agent_name) + r"[\s:]*\*{0,2}\.?\s*$",
+            stripped, re.IGNORECASE
+        ):
+            continue
+
+        # Strip formal section label prefix from start of line
+        # e.g. "**Key Findings:** The truth is..." → "The truth is..."
+        new_line = _FORMAL_LABEL_RE.sub("", stripped)
+
+        # If stripping left nothing (line was just a label), skip it
+        if not new_line.strip():
+            continue
+
+        cleaned.append(new_line)
+
+    result = "\n".join(cleaned)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 class CouncilDebateEngine:
@@ -282,26 +344,48 @@ class CouncilDebateEngine:
         self_model_text = ""
         if self_model_entries:
             latest = sorted(self_model_entries, key=lambda m: m.created_at)[-1]
-            self_model_text = f"\n\n## Your Self-Model (accumulated insight)\n{latest.content}"
+            self_model_text = f"\n\nPast insight about yourself: {latest.content}"
+
+        # Build system content — NO markdown in the system prompt (headers trigger structured output)
+        # Strip "Activate for..." task-activation language from role — it primes models for formal reports
+        role_description = agent.role or ""
+        if ". Activate" in role_description:
+            role_description = role_description.split(". Activate")[0]
+        elif ", Activate" in role_description:
+            role_description = role_description.split(", Activate")[0]
+
+        identity_lines = [f"You are {agent.name}, a {role_description} in this debate."]
+        if agent.personality:
+            # Use first sentence of personality only — avoids long analyst descriptions
+            first_sentence = agent.personality.split(".")[0].strip()
+            if first_sentence:
+                identity_lines.append(f"Style: {first_sentence}.")
+        if self_model_text:
+            identity_lines.append(self_model_text)
+
+        identity = " ".join(identity_lines)
 
         system_content = (
-            f"{agent.system_prompt}"
-            f"{self_model_text}"
-            f"\n\nYou are participating in a council debate. "
-            f"Your role: {agent.role}. "
-            f"Be direct, insightful, and true to your role. "
-            f"Disagree when warranted. Reference other agents by name when engaging their arguments."
+            "You are in a real-time debate with other AI agents. Speak like a sharp colleague, NOT an analyst.\n\n"
+            "STRICT RULES:\n"
+            "1. Simple/factual question → ONE sentence answer. Nothing more.\n"
+            "   Example: Q='What is 2+2?' A='4.'\n"
+            "   Example: Q='What year is it?' A='2026.'\n"
+            "2. Debate question → 2-4 sentences max. No padding.\n"
+            "3. NEVER use headers, bullets, numbered lists, or bold section labels.\n"
+            "4. NEVER use 'Objective:', 'Key Findings:', 'Recommendation:', or any formal labels.\n"
+            "5. NEVER introduce yourself. Start with your actual thought.\n"
+            "6. If you disagree, say so directly and say why.\n\n"
+            f"Your identity: {identity}"
         )
 
         messages: list[dict] = [{"role": "system", "content": system_content}]
 
-        # Council framing
+        # Council framing — plain text, no markdown headers
         context = (
-            f"## Council: {council.title}\n"
-            f"## Topic: {council.topic}\n"
-            f"## Mode: {council.mode}\n\n"
-            f"The following is the current debate transcript. "
-            f"Engage thoughtfully."
+            f"Council: {council.title}\n"
+            f"Topic: {council.topic}\n\n"
+            f"Debate transcript follows. Engage with what was actually said."
         )
         messages.append({"role": "user", "content": context})
 
@@ -326,8 +410,10 @@ class CouncilDebateEngine:
         messages.append({
             "role": "user",
             "content": (
-                f"Now respond as {agent.name} ({agent.role}). "
-                "Be concise but substantive. 2-4 paragraphs maximum."
+                f"Respond now as {agent.name}. "
+                "Speak naturally — no headers, no bullets, no formal sections. "
+                "If the question is simple, give a simple direct answer. "
+                "Max 3 short paragraphs."
             ),
         })
 
@@ -347,6 +433,7 @@ class CouncilDebateEngine:
 
         Returns True if any of:
         - No messages yet (debate just started)
+        - Most recent message is from a human (all agents must respond)
         - Agent is mentioned in the last 3 messages
         - Agent hasn't responded in the last 3 messages
         - Agent config has force_respond=True
@@ -355,6 +442,20 @@ class CouncilDebateEngine:
             return True
 
         if not messages:
+            return True
+
+        # Find the most recent human message and honour its @mentions
+        # across ALL rounds — not just when it's the immediate last message.
+        # This keeps a @NOVA conversation from being hijacked by other agents
+        # until the human changes the subject.
+        last_human_msg = next(
+            (m for m in reversed(messages) if m.role == "human"), None
+        )
+        if last_human_msg and last_human_msg.mentions:
+            return agent.id in last_human_msg.mentions
+
+        # No @mentions in the most recent human message → normal participation
+        if messages[-1].role == "human":
             return True
 
         last_n = messages[-3:]
@@ -519,12 +620,15 @@ class CouncilDebateEngine:
                 full_text = await model_router.generate_full_text(
                     messages=prompt_messages,
                     model=agent.model_preference,
-                    config={"temperature": 0.7, "max_tokens": 800},
+                    config={"temperature": 0.7, "max_tokens": 400},
                     ollama_url=agent_ollama_url,
                 )
             except Exception as exc:
                 logger.error("Agent %s generation failed: %s", agent.name, exc)
                 return None
+
+            # Strip formal report formatting so agents speak like debate participants
+            full_text = _strip_report_formatting(full_text, agent.name)
 
             # Scan agent output for injection patterns (catches hijacked agents)
             scan = prompt_guard.scan(full_text, source="agent")

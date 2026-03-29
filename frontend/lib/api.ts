@@ -203,11 +203,12 @@ export async function deleteCouncil(id: string): Promise<void> {
 
 export async function getMessages(
   councilId: string,
-  params?: { limit?: number; before?: string },
+  params?: { limit?: number; before?: string; after?: string },
 ): Promise<Message[]> {
   const qs = new URLSearchParams();
   if (params?.limit) qs.set('limit', String(params.limit));
   if (params?.before) qs.set('before', params.before);
+  if (params?.after) qs.set('after', params.after);
   const query = qs.toString() ? `?${qs.toString()}` : '';
   const res = await get<{ messages?: Message[]; data?: Message[] } | Message[]>(
     `/api/councils/${councilId}/messages${query}`,
@@ -227,7 +228,7 @@ export async function postMessage(
 // ── Debate control ────────────────────────────────────────────────────────
 
 export async function runRound(councilId: string): Promise<{ started: boolean }> {
-  return post(`/api/councils/${councilId}/run-round`);
+  return post(`/api/councils/${councilId}/run`);
 }
 
 export async function pauseCouncil(councilId: string): Promise<Council> {
