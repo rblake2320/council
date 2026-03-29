@@ -1064,6 +1064,95 @@ class CouncilDebateEngine:
 
         return new_messages
 
+    # ------------------------------------------------------------------
+    # Code patch extraction
+    # ------------------------------------------------------------------
+
+    # Matches: ```html, ```js, ```javascript, ```css, ```ts, ```typescript,
+    # ```jsx, ```tsx, or plain ``` — captures (lang_hint, code_body)
+    _CODE_BLOCK_RE = re.compile(
+        r"```(?P<lang>[a-zA-Z0-9]*)\n(?P<code>.*?)```",
+        re.DOTALL,
+    )
+
+    # Maps common language tags to canonical file extensions
+    _LANG_TO_EXT: dict[str, str] = {
+        "html": "html",
+        "css": "css",
+        "js": "js",
+        "javascript": "js",
+        "ts": "ts",
+        "typescript": "ts",
+        "jsx": "jsx",
+        "tsx": "tsx",
+    }
+
+    # Looks for a filename hint on the line immediately before a code block,
+    # e.g. "here's the updated index.html:" or "update style.css to:"
+    _FILENAME_HINT_RE = re.compile(
+        r"(?:updated?|new|edit(?:ed)?|modified?|here['\u2019]?s[^:\n]*?)?\b"
+        r"([\w\-]+\.(?:html|css|js|ts|jsx|tsx))\b",
+        re.IGNORECASE,
+    )
+
+    def _extract_code_patches(
+        self,
+        content: str,
+        agent_name: str,
+        message_id: str,
+    ) -> list[dict]:
+        """
+        Scan agent message content for fenced code blocks.
+        Returns a list of code_patch dicts ready to broadcast.
+
+        Each dict shape:
+          {
+            "agent_name": str,
+            "filename": str,        # inferred or generated
+            "language": str,        # html | css | js | ts | jsx | tsx
+            "content": str,         # raw code, stripped of leading/trailing whitespace
+            "message_id": str,
+          }
+
+        Filename inference priority:
+          1. Explicit filename in text immediately before the block
+             (e.g. "here's the updated index.html:")
+          2. Agent name + lang tag (e.g. nova-patch.html)
+        """
+        patches = []
+        for match in self._CODE_BLOCK_RE.finditer(content):
+            lang_raw = (match.group("lang") or "").lower().strip()
+            code_body = match.group("code").strip()
+
+            # Only handle recognised web file types; skip unknown/shell/python blocks
+            if lang_raw not in self._LANG_TO_EXT:
+                continue
+            if not code_body:
+                continue
+
+            ext = self._LANG_TO_EXT[lang_raw]
+
+            # Look for a filename hint in the 200 chars preceding this block
+            start = match.start()
+            preceding = content[max(0, start - 200):start]
+            filename_match = None
+            for hint_match in self._FILENAME_HINT_RE.finditer(preceding):
+                filename_match = hint_match  # last one wins (closest to block)
+            if filename_match:
+                filename = filename_match.group(1).lower()
+            else:
+                filename = f"{agent_name.lower()}-patch.{ext}"
+
+            patches.append({
+                "agent_name": agent_name,
+                "filename": filename,
+                "language": ext,
+                "content": code_body,
+                "message_id": message_id,
+            })
+
+        return patches
+
     async def _broadcast_messages(
         self,
         council_id: UUID,
@@ -1071,7 +1160,13 @@ class CouncilDebateEngine:
         redis,
         agents: list | None = None,
     ) -> None:
-        """Publish each message to the Redis channel for this council."""
+        """Publish each message to the Redis channel for this council.
+
+        For each message that contains a recognised code block, an additional
+        ``code_patch`` event is published on the same channel immediately after
+        the parent ``message`` event.  The frontend can then prompt the user to
+        accept or reject the patch.
+        """
         import json  # noqa: PLC0415
 
         channel = f"council:{council_id}"
@@ -1096,6 +1191,32 @@ class CouncilDebateEngine:
                 await redis.publish(channel, json.dumps(payload))
             except Exception as exc:
                 logger.warning("Redis publish failed for council %s: %s", council_id, exc)
+
+            # --- code_patch events -------------------------------------------
+            # Only emit for agent messages that contain code blocks
+            if msg.role != "agent" or not agent:
+                continue
+
+            patches = self._extract_code_patches(
+                content=msg.content,
+                agent_name=agent.name,
+                message_id=str(msg.id),
+            )
+            for patch in patches:
+                patch_payload = {
+                    "type": "code_patch",
+                    "data": patch,
+                }
+                try:
+                    await redis.publish(channel, json.dumps(patch_payload))
+                    logger.info(
+                        "code_patch emitted: agent=%s file=%s council=%s",
+                        agent.name, patch["filename"], council_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "code_patch publish failed for council %s: %s", council_id, exc
+                    )
 
 
 # Module-level singleton

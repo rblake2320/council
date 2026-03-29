@@ -10,11 +10,13 @@ import type {
   AgentRuntimeState,
   AgentStatus,
   AgentSummary,
+  AppliedPatch,
   Council,
   CouncilStatus,
   CouncilSummary,
   HealthStatus,
   Message,
+  PendingPatch,
   Synthesis,
 } from './types';
 
@@ -168,6 +170,10 @@ interface CouncilState {
   currentRound: number;
   sseConnected: boolean;
 
+  // Code patches
+  pendingPatches: PendingPatch[];
+  appliedPatches: AppliedPatch[];
+
   // List actions
   setCouncils: (councils: CouncilSummary[]) => void;
   setCouncilsLoading: (v: boolean) => void;
@@ -190,6 +196,11 @@ interface CouncilState {
   setAgentPosition: (agentId: string, position: AgentPosition) => void;
   initAgentStates: (participants: Array<{ agent_id: string }>) => void;
   clearActiveCouncil: () => void;
+
+  // Patch actions
+  addPendingPatch: (patch: PendingPatch) => void;
+  acceptPatch: (patchId: string) => AppliedPatch | null;
+  rejectPatch: (patchId: string) => void;
 }
 
 export const useCouncilStore = create<CouncilState>((set, get) => ({
@@ -205,6 +216,8 @@ export const useCouncilStore = create<CouncilState>((set, get) => ({
   typingAgents: new Set(),
   currentRound: 0,
   sseConnected: false,
+  pendingPatches: [],
+  appliedPatches: [],
 
   setCouncils(councils) {
     set({ councils });
@@ -401,6 +414,34 @@ export const useCouncilStore = create<CouncilState>((set, get) => ({
       typingAgents: new Set(),
       currentRound: 0,
       sseConnected: false,
+      pendingPatches: [],
+      appliedPatches: [],
     });
+  },
+
+  addPendingPatch(patch) {
+    set((s) => ({
+      pendingPatches: [...s.pendingPatches, patch],
+    }));
+  },
+
+  acceptPatch(patchId) {
+    let accepted: AppliedPatch | null = null;
+    set((s) => {
+      const pending = s.pendingPatches.find((p) => p.patch_id === patchId);
+      if (!pending) return {};
+      accepted = { ...pending, applied_at: Date.now() };
+      return {
+        pendingPatches: s.pendingPatches.filter((p) => p.patch_id !== patchId),
+        appliedPatches: [...s.appliedPatches, accepted],
+      };
+    });
+    return accepted;
+  },
+
+  rejectPatch(patchId) {
+    set((s) => ({
+      pendingPatches: s.pendingPatches.filter((p) => p.patch_id !== patchId),
+    }));
   },
 }));

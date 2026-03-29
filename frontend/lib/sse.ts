@@ -4,7 +4,7 @@
  * Handles reconnect with exponential backoff.
  */
 
-import type { Message, Synthesis, CouncilStatus } from './types';
+import type { CodePatch, Message, Synthesis, CouncilStatus } from './types';
 
 export interface SSECallbacks {
   onMessage?: (msg: Message) => void;
@@ -12,6 +12,8 @@ export interface SSECallbacks {
   onRoundStart?: (round: number, agentCount: number) => void;
   onSynthesis?: (synthesis: Synthesis) => void;
   onStatusChange?: (status: CouncilStatus) => void;
+  /** Called whenever an agent emits a code block targeting a workspace file */
+  onCodePatch?: (patch: CodePatch) => void;
   onError?: (err: Event) => void;
   onConnected?: () => void;
   onDisconnected?: () => void;
@@ -105,6 +107,13 @@ export function subscribeToCouncil(
       } catch { /* noop */ }
     });
 
+    es.addEventListener('code_patch', (event) => {
+      try {
+        const patch = JSON.parse(event.data as string) as CodePatch;
+        callbacks.onCodePatch?.(patch);
+      } catch { /* noop */ }
+    });
+
     es.onerror = (err) => {
       callbacks.onError?.(err);
       callbacks.onDisconnected?.();
@@ -140,6 +149,9 @@ export function subscribeToCouncil(
         break;
       case 'status':
         callbacks.onStatusChange?.((data as { status: CouncilStatus }).status);
+        break;
+      case 'code_patch':
+        callbacks.onCodePatch?.(data as CodePatch);
         break;
     }
   }

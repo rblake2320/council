@@ -273,12 +273,47 @@ export interface SSEStatusEvent {
   };
 }
 
+// ── Code patch (agent → workspace) ────────────────────────────────────────
+
+export interface CodePatch {
+  /** Agent that proposed the patch */
+  agent_name: string;
+  /** Target filename (e.g. "index.html", "style.css") */
+  filename: string;
+  /** Canonical language tag: html | css | js | ts | jsx | tsx */
+  language: string;
+  /** Full replacement content for the file */
+  content: string;
+  /** ID of the parent message this patch came from */
+  message_id: string;
+}
+
+export interface SSECodePatchEvent {
+  type: 'code_patch';
+  data: CodePatch;
+}
+
+/** A pending patch waiting for the human to accept or reject */
+export interface PendingPatch extends CodePatch {
+  /** Client-assigned unique key for this notification card */
+  patch_id: string;
+  /** Unix ms timestamp when patch was received */
+  received_at: number;
+}
+
+/** A patch that has been applied to the workspace */
+export interface AppliedPatch extends CodePatch {
+  patch_id: string;
+  applied_at: number;
+}
+
 export type SSEEvent =
   | SSEMessageEvent
   | SSETypingEvent
   | SSERoundStartEvent
   | SSESynthesisEvent
-  | SSEStatusEvent;
+  | SSEStatusEvent
+  | SSECodePatchEvent;
 
 // ── Health ─────────────────────────────────────────────────────────────────
 

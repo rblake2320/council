@@ -11,10 +11,12 @@ import {
   pauseCouncil,
   resumeCouncil,
   endCouncil,
+  archiveCouncil,
   synthesize,
   getSynthesis,
 } from '@/lib/api';
 import { subscribeToCouncil } from '@/lib/sse';
+import type { CodePatch } from '@/lib/types';
 import { useCouncilStore, useAppStore } from '@/lib/stores';
 import { truncate, formatDuration } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
@@ -24,6 +26,7 @@ import { AgentCard } from '@/components/agents/AgentCard';
 import { MessageBubble } from '@/components/councils/MessageBubble';
 import { ThinkingIndicator } from '@/components/councils/ThinkingIndicator';
 import { SynthesisPanel } from '@/components/councils/SynthesisPanel';
+import { BuildWorkspace } from '@/components/build/BuildWorkspace';
 import {
   ArrowLeft,
   Play,
@@ -35,6 +38,10 @@ import {
   Download,
   Wifi,
   WifiOff,
+  MessageSquare,
+  Code2,
+  Archive,
+  History,
 } from 'lucide-react';
 import Link from 'next/link';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -137,8 +144,10 @@ function DebateContent() {
   } = useCouncilStore();
 
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
+  const patchHandlerRef = React.useRef<((patch: CodePatch) => void) | null>(null);
   const [synthesizing, setSynthesizing] = React.useState(false);
   const [controlLoading, setControlLoading] = React.useState<string | null>(null);
+  const [activeTab, setActiveTab] = React.useState<'debate' | 'build'>('debate');
 
   const { data: council, isLoading, error } = useQuery({
     queryKey: ['council', params.id],
@@ -175,6 +184,7 @@ function DebateContent() {
       onRoundStart: (round) => setCurrentRound(round),
       onSynthesis: (s) => setSynthesis(s),
       onStatusChange: (status) => setCouncilStatus(status),
+      onCodePatch: (patch) => { patchHandlerRef.current?.(patch); },
     });
     return () => sub.close();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -268,6 +278,20 @@ function DebateContent() {
     }
   }
 
+  async function handleArchive() {
+    if (!confirm('Archive this session? It will be saved to history and marked as archived.')) return;
+    setControlLoading('archive');
+    try {
+      await archiveCouncil(params.id);
+      addToast({ type: 'success', message: 'Session archived — find it in Meeting History' });
+      setActiveCouncil({ ...activeCouncil!, status: 'archived' });
+    } catch (err: unknown) {
+      addToast({ type: 'error', message: err instanceof Error ? err.message : 'Archive failed' });
+    } finally {
+      setControlLoading(null);
+    }
+  }
+
   async function handleExport() {
     if (!activeCouncil) return;
     const data = {
@@ -328,6 +352,32 @@ function DebateContent() {
           </div>
         </div>
 
+        {/* Tab switcher */}
+        <div className="flex items-center gap-0.5 bg-[#0B0D14] rounded-lg p-0.5 shrink-0">
+          <button
+            onClick={() => setActiveTab('debate')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold transition ${
+              activeTab === 'debate'
+                ? 'bg-[#1E2240] text-[#E8E8F0]'
+                : 'text-[#4A5070] hover:text-[#8B90B8]'
+            }`}
+          >
+            <MessageSquare size={11} />
+            Debate
+          </button>
+          <button
+            onClick={() => setActiveTab('build')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold transition ${
+              activeTab === 'build'
+                ? 'bg-[#1E2240] text-[#E8E8F0]'
+                : 'text-[#4A5070] hover:text-[#8B90B8]'
+            }`}
+          >
+            <Code2 size={11} />
+            Build
+          </button>
+        </div>
+
         <div className="flex items-center gap-1.5 shrink-0">
           {sseConnected
             ? <Wifi size={11} style={{ color: 'var(--state-yes)' }} />
@@ -353,7 +403,17 @@ function DebateContent() {
               <StopCircle size={11} />
             </Button>
           )}
-          <Button variant="ghost" size="icon" onClick={handleExport}><Download size={13} /></Button>
+          <Button variant="ghost" size="icon" onClick={handleExport} title="Export JSON"><Download size={13} /></Button>
+          {councilStatus !== 'archived' && (
+            <Button variant="ghost" size="icon" onClick={handleArchive}
+              disabled={controlLoading === 'archive'} title="Archive to history"
+              loading={controlLoading === 'archive'}>
+              <Archive size={13} />
+            </Button>
+          )}
+          <Link href="/councils" title="Meeting History">
+            <Button variant="ghost" size="icon"><History size={13} /></Button>
+          </Link>
           {synthesis && (
             <Link href={`/councils/${params.id}/synthesis`}>
               <Button variant="default" size="sm">Verdict <ChevronRight size={11} /></Button>
@@ -362,8 +422,19 @@ function DebateContent() {
         </div>
       </div>
 
-      {/* Three panels */}
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+      {/* Build workspace tab */}
+      {activeTab === 'build' && (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <BuildWorkspace
+            councilId={params.id}
+            councilTopic={council.topic}
+            onRegisterPatchHandler={(handler) => { patchHandlerRef.current = handler; }}
+          />
+        </div>
+      )}
+
+      {/* Debate panels (hidden when build tab active) */}
+      <div className={`flex flex-1 min-h-0 overflow-hidden ${activeTab === 'build' ? 'hidden' : ''}`}>
 
         {/* LEFT — Agent roster */}
         <div className="hidden lg:flex flex-col w-56 shrink-0 border-r border-[#1E2240] bg-[#111320] overflow-y-auto">

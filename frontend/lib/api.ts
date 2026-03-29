@@ -243,6 +243,10 @@ export async function endCouncil(councilId: string): Promise<Council> {
   return post(`/api/councils/${councilId}/end`);
 }
 
+export async function archiveCouncil(councilId: string): Promise<{ archived: string }> {
+  return del(`/api/councils/${councilId}`);
+}
+
 // ── Synthesis ─────────────────────────────────────────────────────────────
 
 export async function synthesize(councilId: string): Promise<Synthesis> {
