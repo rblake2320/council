@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import generate_api_key, optional_api_key, require_api_key
-from app.db import get_db
+from app.db import get_db, AsyncSessionLocal
 from app.engine.debate import debate_engine
 from app.engine.synthesis import synthesis_engine
 from app.models.agent import Agent
@@ -276,6 +276,14 @@ async def post_message(
             _broadcast_single_message, council_id, msg, redis
         )
 
+    # Auto-trigger a full debate session so agents respond and keep going until done
+    if body.role == "human":
+        async def _auto_respond():
+            async with AsyncSessionLocal() as fresh_db:
+                await debate_engine.run_session(council_id, fresh_db, redis, triggered_by="human")
+
+        background_tasks.add_task(_auto_respond)
+
     out = _message_to_dict(msg, agent_name=None, agent_role=None)
     return make_response(data=out)
 
@@ -390,8 +398,13 @@ async def run_debate_round(
             detail={"code": "COUNCIL_NOT_ACTIVE", "message": f"Status is '{council.status}'. Resume before running."},
         )
     redis = getattr(request.app.state, "redis", None)
-    background_tasks.add_task(debate_engine.run_round, council_id, db, redis)
-    return make_response(data={"status": "round_started", "council_id": str(council_id)})
+
+    async def _run_session_with_fresh_db():
+        async with AsyncSessionLocal() as fresh_db:
+            await debate_engine.run_session(council_id, fresh_db, redis, triggered_by="manual")
+
+    background_tasks.add_task(_run_session_with_fresh_db)
+    return make_response(data={"status": "session_started", "council_id": str(council_id)})
 
 
 @router.post("/{council_id}/pause", response_model=dict, summary="Pause debate")

@@ -226,7 +226,7 @@ def upgrade() -> None:
             "events",
             postgresql.ARRAY(sa.Text()),
             nullable=False,
-            server_default="'{message,synthesis,status_change}'",
+            server_default=sa.text("ARRAY['message','synthesis','status_change']"),
         ),
         sa.Column("secret", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()"), nullable=False),

@@ -28,6 +28,11 @@ _nvidia = OpenAIProvider(
     base_url=settings.nvidia_base_url,
     provider_name="nvidia-nim",
 )
+_gemini = OpenAIProvider(
+    api_key=settings.gemini_api_key,
+    base_url=settings.gemini_base_url,
+    provider_name="google-gemini",
+)
 
 
 def resolve_provider(model: str) -> str:
@@ -41,10 +46,23 @@ def resolve_provider(model: str) -> str:
         return "openai"
     if m.startswith("nvidia-") or m.startswith("nim-") or m.startswith("meta/") or m.startswith("mistralai/"):
         return "nvidia"
+    if m.startswith("gemini-") or m.startswith("models/gemini-") or m.startswith("models/gemma-"):
+        return "gemini"
     return "ollama"
 
 
 class ModelRouter:
+
+    # Cache of custom Ollama providers keyed by URL
+    _custom_ollama: dict[str, "OllamaProvider"] = {}
+
+    def _get_ollama_for_url(self, url: str | None) -> "OllamaProvider":
+        """Return a cached OllamaProvider for a given URL (supports remote machines)."""
+        if not url or url == settings.ollama_url:
+            return _ollama
+        if url not in self._custom_ollama:
+            self._custom_ollama[url] = OllamaProvider(base_url=url)
+        return self._custom_ollama[url]
 
     async def generate(
         self,
@@ -52,9 +70,13 @@ class ModelRouter:
         model: str,
         config: dict | None = None,
         stream: bool = True,
+        ollama_url: str | None = None,  # per-agent override for remote Ollama machines
     ) -> AsyncGenerator[str, None]:
         """
         Route generation to the correct provider.
+
+        ollama_url: if set, routes Ollama traffic to a remote machine instead of localhost.
+                    Set this from agent.config['ollama_url'] to enable multi-machine collaboration.
 
         Falls back to Ollama default model if the preferred model fails.
         Always an async generator — callers iterate over tokens.
@@ -63,6 +85,7 @@ class ModelRouter:
             config = {}
 
         provider_tag = resolve_provider(model)
+        ollama_provider = self._get_ollama_for_url(ollama_url)
 
         async def _try_generate(mdl: str, tag: str) -> AsyncGenerator[str, None]:
             if tag == "anthropic":
@@ -74,8 +97,11 @@ class ModelRouter:
             elif tag == "nvidia":
                 async for chunk in _nvidia.generate(messages, mdl, config):
                     yield chunk
+            elif tag == "gemini":
+                async for chunk in _gemini.generate(messages, mdl, config):
+                    yield chunk
             else:
-                async for chunk in _ollama.generate(messages, mdl, config):
+                async for chunk in ollama_provider.generate(messages, mdl, config):
                     yield chunk
 
         try:
@@ -90,7 +116,7 @@ class ModelRouter:
             if fallback == model:
                 raise  # prevent infinite loop if default already failed
             try:
-                async for chunk in _ollama.generate(messages, fallback, config):
+                async for chunk in ollama_provider.generate(messages, fallback, config):
                     yield chunk
             except Exception as fallback_exc:
                 logger.error("Fallback model %s also failed: %s", fallback, fallback_exc)
@@ -104,7 +130,8 @@ class ModelRouter:
             "ollama": await _ollama.health_check(),
             "anthropic": await _anthropic.health_check(),
             "openai": await _openai.health_check(),
-            "nvidia": bool(settings.nvidia_api_key),  # NIM: just key presence check
+            "nvidia": bool(settings.nvidia_api_key),
+            "gemini": bool(settings.gemini_api_key),
         }
 
 
@@ -113,10 +140,11 @@ class ModelRouter:
         messages: list[dict],
         model: str,
         config: dict | None = None,
+        ollama_url: str | None = None,
     ) -> str:
         """Convenience wrapper — collects all streamed chunks into a single string."""
         chunks: list[str] = []
-        async for chunk in self.generate(messages=messages, model=model, config=config):
+        async for chunk in self.generate(messages=messages, model=model, config=config, ollama_url=ollama_url):
             chunks.append(chunk)
         return "".join(chunks)
 

@@ -897,7 +897,7 @@ async def run() -> None:
                 agent["system_prompt"],
                 agent["model_preference"],
                 agent["tools_allowed"],
-                {},  # config — empty JSONB default
+                "{}",  # config — empty JSONB default
                 api_key,
             )
 

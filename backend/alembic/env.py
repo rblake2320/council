@@ -28,7 +28,8 @@ import app.models.council  # noqa: F401, E402
 config = context.config
 
 # Override the sqlalchemy.url with the value from app settings
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Escape % to %% so configparser doesn't treat it as interpolation syntax
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 # Interpret logging config from alembic.ini
 if config.config_file_name is not None:

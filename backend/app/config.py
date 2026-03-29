@@ -1,5 +1,16 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+import os
+from pathlib import Path
+
+# Load .env file BEFORE pydantic reads env vars, so .env takes priority over stale system env vars
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ[k.strip()] = v.strip()
 
 
 class Settings(BaseSettings):
@@ -15,6 +26,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
     # Model defaults
     default_model: str = "gemma3:latest"

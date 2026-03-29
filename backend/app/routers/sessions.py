@@ -25,9 +25,9 @@ from fastapi.websockets import WebSocketState
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import generate_api_key, require_api_key
+from app.auth import generate_api_key, require_api_key, optional_api_key
 from app.db import get_db, AsyncSessionLocal
-from app.models.council import ApiKey, Message, Council
+from app.models.council import ApiKey, Message, Council, HumanParticipant
 from app.models.agent import Agent
 from app.schemas.council import ApiKeyCreate, ApiKeyCreated, ApiKeyOut
 from app.utils import make_response
@@ -188,12 +188,112 @@ async def websocket_council(
                             "message": "Invalid or expired token.",
                         })
 
+                elif msg_type == "join":
+                    # Human joins the council as a named participant.
+                    # Protocol: {type: "join", display_name: "Ron", identity: "ron@example.com",
+                    #            council_role: "participant"}
+                    # After joining, they appear in the participant roster alongside AI agents.
+                    display_name = msg.get("display_name", "").strip()
+                    if not display_name:
+                        await websocket.send_json({
+                            "type": "error",
+                            "code": "DISPLAY_NAME_REQUIRED",
+                            "message": "display_name is required to join as a human participant.",
+                        })
+                        continue
+
+                    identity = msg.get("identity", "").strip() or None
+                    council_role = msg.get("council_role", "participant")
+                    if council_role not in ("owner", "participant", "observer"):
+                        council_role = "participant"
+
+                    # Register human participant in DB
+                    async with AsyncSessionLocal() as db:
+                        from sqlalchemy import select as sa_select  # noqa: PLC0415
+                        # Try to find existing record (reconnect case)
+                        existing = await db.execute(
+                            sa_select(HumanParticipant).where(
+                                HumanParticipant.council_id == council_id,
+                                HumanParticipant.display_name == display_name,
+                            )
+                        )
+                        hp = existing.scalar_one_or_none()
+                        if hp is None:
+                            hp = HumanParticipant(
+                                council_id=council_id,
+                                display_name=display_name,
+                                identity=identity,
+                                council_role=council_role,
+                                is_online=True,
+                            )
+                            db.add(hp)
+                        else:
+                            hp.is_online = True
+                            hp.last_seen_at = datetime.now(timezone.utc)
+                        await db.commit()
+                        await db.refresh(hp)
+                        human_participant_id = hp.id
+
+                    # Store identity in session registry
+                    session_registry._sessions[session_id]["display_name"] = display_name
+                    session_registry._sessions[session_id]["human_participant_id"] = str(human_participant_id)
+                    session_registry._sessions[session_id]["council_role"] = council_role
+                    session_registry._sessions[session_id]["authenticated"] = True  # joining = authenticated
+
+                    # Broadcast join event so UI shows human in roster
+                    if app_redis:
+                        await app_redis.publish(channel, json.dumps({
+                            "type": "human_joined",
+                            "data": {
+                                "id": str(human_participant_id),
+                                "display_name": display_name,
+                                "council_role": council_role,
+                                "council_id": str(council_id),
+                            },
+                        }))
+
+                    await websocket.send_json({
+                        "type": "joined",
+                        "human_participant_id": str(human_participant_id),
+                        "display_name": display_name,
+                        "council_role": council_role,
+                    })
+
+                elif msg_type == "twin_override":
+                    # Human takes over from their digital twin mid-meeting.
+                    # While override is active, the twin will not auto-respond.
+                    # Protocol: {type: "twin_override", active: true}
+                    active = bool(msg.get("active", True))
+                    hp_id = session_registry._sessions.get(session_id, {}).get("human_participant_id")
+                    if hp_id:
+                        async with AsyncSessionLocal() as db:
+                            from sqlalchemy import select as sa_select  # noqa: PLC0415
+                            result = await db.execute(
+                                sa_select(HumanParticipant).where(HumanParticipant.id == hp_id)
+                            )
+                            hp = result.scalar_one_or_none()
+                            if hp:
+                                hp.twin_override_active = active
+                                await db.commit()
+
+                    # Broadcast so the debate engine knows to skip the twin
+                    if app_redis:
+                        await app_redis.publish(channel, json.dumps({
+                            "type": "twin_override",
+                            "data": {
+                                "session_id": session_id,
+                                "display_name": session_registry._sessions.get(session_id, {}).get("display_name", "Human"),
+                                "active": active,
+                            },
+                        }))
+                    await websocket.send_json({"type": "twin_override_ack", "active": active})
+
                 elif msg_type == "message":
                     if not session_registry._sessions.get(session_id, {}).get("authenticated"):
                         await websocket.send_json({
                             "type": "error",
                             "code": "UNAUTHORIZED",
-                            "message": "Authenticate first via ?token= or {type: 'auth', token: '...'}",
+                            "message": "Join first: {type: 'join', display_name: 'Your Name'} or authenticate via ?token=",
                         })
                         continue
 
@@ -201,16 +301,31 @@ async def websocket_council(
                     if not content:
                         continue
 
-                    # Persist and broadcast
+                    sess = session_registry._sessions.get(session_id, {})
+                    display_name = sess.get("display_name")
+                    hp_id = sess.get("human_participant_id")
+
+                    # Persist message with human identity
                     async with AsyncSessionLocal() as db:
                         new_msg = Message(
                             council_id=council_id,
                             agent_id=None,
-                            role=msg.get("role", "human"),
+                            role="human",
                             content=content,
                             mentions=[],
-                            metadata_=msg.get("metadata", {}),
+                            metadata_={
+                                **msg.get("metadata", {}),
+                                "display_name": display_name,
+                                "council_role": sess.get("council_role", "participant"),
+                            },
                         )
+                        # Set human_participant_id if available (requires migration 003)
+                        if hp_id:
+                            try:
+                                new_msg.human_participant_id = hp_id  # type: ignore[attr-defined]
+                                new_msg.display_name = display_name  # type: ignore[attr-defined]
+                            except Exception:
+                                pass  # Column not yet migrated
                         db.add(new_msg)
                         await db.commit()
                         await db.refresh(new_msg)
@@ -224,17 +339,22 @@ async def websocket_council(
                                 "agent_id": None,
                                 "role": new_msg.role,
                                 "content": new_msg.content,
+                                "display_name": display_name,
+                                "human_participant_id": hp_id,
                                 "created_at": new_msg.created_at.isoformat(),
                             },
                         }
                         await app_redis.publish(channel, json.dumps(payload))
 
                 elif msg_type == "typing":
-                    # Broadcast typing indicator
+                    # Broadcast typing indicator with human name
+                    sess = session_registry._sessions.get(session_id, {})
                     if app_redis:
                         typing_payload = {
                             "type": "typing",
                             "session_id": session_id,
+                            "display_name": sess.get("display_name"),
+                            "is_human": True,
                         }
                         await app_redis.publish(channel, json.dumps(typing_payload))
 
@@ -327,7 +447,7 @@ async def list_sessions(
 async def create_api_key(
     body: ApiKeyCreate,
     db: AsyncSession = Depends(get_db),
-    _key: dict = Depends(require_api_key),
+    _key: Optional[dict] = Depends(optional_api_key),
 ):
     from app.auth import generate_api_key as gen_key  # noqa: PLC0415
 

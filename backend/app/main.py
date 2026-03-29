@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.routers import agents, councils, sessions
+from app.routers import agents, councils, sessions, notifications, keys
 from app.utils import make_response
 
 logger = logging.getLogger(__name__)
@@ -60,13 +60,8 @@ async def lifespan(app: FastAPI):
         logger.warning("Redis not available: %s — WebSocket/SSE broadcast will not work", exc)
         app.state.redis = None
 
-    # Alembic migrations
-    try:
-        _run_migrations()
-        logger.info("Database migrations applied")
-    except Exception as exc:
-        logger.error("Migration failed: %s", exc)
-        # Don't block startup — let the app start so /api/health reports the DB issue
+    # Alembic migrations — skip at runtime (run `alembic upgrade head` manually before start)
+    logger.info("Skipping runtime migrations — run 'alembic upgrade head' separately if needed")
 
     yield
 
@@ -200,6 +195,8 @@ async def not_found_handler(request: Request, exc):
 app.include_router(agents.router)
 app.include_router(councils.router)
 app.include_router(sessions.router)
+app.include_router(notifications.router)
+app.include_router(keys.router)
 
 
 # ---------------------------------------------------------------------------

@@ -295,3 +295,132 @@ class Webhook(Base):
     agent: Mapped[Optional["Agent"]] = relationship(
         "Agent", back_populates="webhooks"
     )
+
+
+# ---------------------------------------------------------------------------
+# HumanParticipant (migration 003)
+# ---------------------------------------------------------------------------
+
+class HumanParticipant(Base):
+    """
+    A human participating directly in a council debate.
+    Humans are first-class participants — they appear in the roster alongside
+    AI agents, their messages are attributed by name, and they can take over
+    from their digital twin mid-meeting.
+    """
+    __tablename__ = "human_participants"
+    __table_args__ = (
+        CheckConstraint(
+            "council_role IN ('owner','participant','observer')",
+            name="ck_human_council_role",
+        ),
+        {"schema": "council"},
+    )
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    council_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("council.councils.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    identity: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # email or external ID
+    council_role: Mapped[str] = mapped_column(Text, nullable=False, default="participant")
+    is_online: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    twin_agent_id: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("council.agents.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    twin_override_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    joined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return f"<HumanParticipant name={self.display_name!r} council={self.council_id}>"
+
+
+# ---------------------------------------------------------------------------
+# NotificationChannel (migration 004)
+# ---------------------------------------------------------------------------
+
+class NotificationChannel(Base):
+    """
+    Where to reach a human when their twin needs them — SMS, email, webhook, push.
+    When a twin hits a decision outside its authorization scope, or when a meeting
+    concludes, notifications fire through all active channels for that human identity.
+    """
+    __tablename__ = "notification_channels"
+    __table_args__ = (
+        CheckConstraint(
+            "channel_type IN ('sms','email','webhook','push','slack','discord')",
+            name="ck_channel_type",
+        ),
+        {"schema": "council"},
+    )
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    identity: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_type: Mapped[str] = mapped_column(Text, nullable=False)
+    destination: Mapped[str] = mapped_column(Text, nullable=False)
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    notify_on: Mapped[List[str]] = mapped_column(
+        ARRAY(Text),
+        nullable=False,
+        default=lambda: ["twin_needs_input", "meeting_complete", "synthesis_ready"],
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# TwinEscalation (migration 004)
+# ---------------------------------------------------------------------------
+
+class TwinEscalation(Base):
+    """
+    When a twin hits a decision outside its authorization scope, it escalates
+    to its human. The debate engine pauses that agent's turn, fires notifications,
+    and waits for human_instruction before generating the agent's actual response.
+    Timeout = twin abstains and debate continues.
+    """
+    __tablename__ = "twin_escalations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','human_responded','timed_out','auto_resolved')",
+            name="ck_escalation_status",
+        ),
+        {"schema": "council"},
+    )
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    council_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("council.councils.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("council.agents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    trigger_message_id: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("council.messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    escalation_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    twin_tentative_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    human_instruction: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
+    escalated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

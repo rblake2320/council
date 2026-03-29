@@ -31,9 +31,159 @@ logger = logging.getLogger(__name__)
 
 class CouncilDebateEngine:
 
+    def __init__(self):
+        # Track which councils have an active session running so we don't double-fire
+        self._running: set[str] = set()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    # Approximate cost per 1M tokens (input+output blended) in USD
+    _COST_PER_1M = {
+        "claude-haiku-4-5-20251001": 0.80,
+        "claude-sonnet-4-6":         3.00,
+        "claude-opus-4-6":           15.0,
+        "gpt-4o-mini":               0.15,
+        "gpt-4o":                    5.00,
+        "models/gemini-2.5-flash":   0.15,
+        "models/gemini-2.0-flash":   0.15,
+        # ollama models are free (local)
+    }
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimate: ~4 chars per token."""
+        return max(1, len(text) // 4)
+
+    def _estimate_cost(self, model: str, tokens: int) -> float:
+        rate = self._COST_PER_1M.get(model, 0.0)
+        return (tokens / 1_000_000) * rate
+
+    async def run_session(
+        self,
+        council_id: UUID,
+        db: AsyncSession,
+        redis=None,
+        triggered_by: str = "human",
+    ) -> None:
+        """
+        Run a full debate session — keeps firing rounds until:
+        - No agents respond in a round (debate reached natural conclusion)
+        - Max rounds for this council mode are exhausted
+        - Token or cost budget from council config is exceeded
+        - Council status changes away from 'active'
+
+        council.config keys honoured:
+            max_rounds     (int)   — override mode default
+            token_budget   (int)   — max total estimated tokens this session
+            cost_limit_usd (float) — max spend in USD this session
+
+        Prevents concurrent sessions on the same council via _running guard.
+        """
+        key = str(council_id)
+        if key in self._running:
+            logger.info("Session already running for council %s — skipping duplicate trigger", council_id)
+            return
+
+        self._running.add(key)
+        try:
+            result = await db.execute(select(Council).where(Council.id == council_id))
+            council = result.scalar_one_or_none()
+            if council is None or council.status != "active":
+                return
+
+            cfg = council.config or {}
+            # Max rounds: explicit config > mode default
+            max_rounds = cfg.get("max_rounds") or {"quick": 3, "standard": 8, "marathon": 30}.get(council.mode, 5)
+            # Budget guards (None = unlimited)
+            token_budget: int | None = cfg.get("token_budget")
+            cost_limit: float | None = cfg.get("cost_limit_usd")
+
+            session_tokens = 0
+            session_cost = 0.0
+
+            for round_num in range(max_rounds):
+                await db.refresh(council)
+                if council.status != "active":
+                    logger.info("Council %s paused/completed — stopping session", council_id)
+                    break
+
+                # Budget pre-check
+                if token_budget and session_tokens >= token_budget:
+                    logger.warning(
+                        "Council %s: token budget %d reached (%d used) — stopping",
+                        council_id, token_budget, session_tokens,
+                    )
+                    await self._post_system_message(
+                        council_id, db, redis,
+                        f"[Session paused: token budget of {token_budget:,} tokens reached. "
+                        f"Estimated spend so far: ${session_cost:.4f}]"
+                    )
+                    break
+
+                if cost_limit and session_cost >= cost_limit:
+                    logger.warning(
+                        "Council %s: cost limit $%.4f reached ($%.4f used) — stopping",
+                        council_id, cost_limit, session_cost,
+                    )
+                    await self._post_system_message(
+                        council_id, db, redis,
+                        f"[Session paused: cost limit ${cost_limit:.2f} reached. "
+                        f"Tokens used: {session_tokens:,}]"
+                    )
+                    break
+
+                new_messages = await self.run_round(council_id, db, redis)
+
+                if not new_messages:
+                    logger.info(
+                        "Council %s: no agents responded in round %d — debate concluded",
+                        council_id, round_num + 1,
+                    )
+                    break
+
+                # Track usage
+                for msg in new_messages:
+                    tokens = self._estimate_tokens(msg.content)
+                    model = (msg.metadata_ or {}).get("model_used", "")
+                    cost = self._estimate_cost(model, tokens)
+                    session_tokens += tokens
+                    session_cost += cost
+
+                logger.info(
+                    "Council %s: round %d — %d responses | session: ~%d tokens ~$%.4f",
+                    council_id, round_num + 1, len(new_messages), session_tokens, session_cost,
+                )
+
+                await asyncio.sleep(2)
+
+        finally:
+            self._running.discard(key)
+
+    async def _post_system_message(
+        self, council_id: UUID, db: AsyncSession, redis, content: str
+    ) -> None:
+        """Post a system-level notice to the council transcript."""
+        msg = Message(
+            council_id=council_id,
+            agent_id=None,
+            role="system",
+            content=content,
+            mentions=[],
+            metadata_={},
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+        if redis:
+            import json  # noqa: PLC0415
+            await redis.publish(
+                f"council:{council_id}",
+                json.dumps({"type": "message", "data": {
+                    "id": str(msg.id), "role": "system", "content": content,
+                    "created_at": msg.created_at.isoformat(),
+                }}),
+            )
 
     async def run_round(
         self,
@@ -271,9 +421,51 @@ class CouncilDebateEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
+    # Models that run locally (free tokens — no compression needed)
+    _LOCAL_PREFIXES = ("llama", "mistral", "qwen", "gemma", "phi", "deepseek",
+                       "codellama", "vicuna", "orca", "neural", "wizard", "imds")
+
+    def _is_local_model(self, model: str) -> bool:
+        """Return True if this model runs on Ollama (free, no token cost)."""
+        m = model.lower()
+        return not any(m.startswith(p) for p in ("claude-", "gpt-", "gemini", "models/", "nvidia-", "nim-", "meta/", "mistralai/"))
+
+    async def _load_context_for_agent(
+        self, agent: Agent, council_id: UUID, db: AsyncSession
+    ) -> list[Message]:
+        """
+        Load the debate transcript for this specific agent.
+
+        Local models (Ollama): full history — free tokens, no limit.
+        API models (Claude/GPT/Gemini): sliding window of recent messages.
+          If history is long, a cached summary replaces the older half so
+          the agent still has full context without re-reading every word.
+        """
+        if self._is_local_model(agent.model_preference or ""):
+            # Full history — local model, no cost
+            result = await db.execute(
+                select(Message)
+                .options(selectinload(Message.agent))
+                .where(Message.council_id == council_id)
+                .order_by(Message.created_at.asc())
+            )
+            return list(result.scalars().all())
+
+        # API model — use sliding window
+        window = int((agent.config or {}).get("context_window", settings.debate_context_messages))
+        result = await db.execute(
+            select(Message)
+            .options(selectinload(Message.agent))
+            .where(Message.council_id == council_id)
+            .order_by(Message.created_at.desc())
+            .limit(window)
+        )
+        return list(reversed(result.scalars().all()))
+
     async def _load_recent_messages(
         self, council_id: UUID, db: AsyncSession
     ) -> list[Message]:
+        """Legacy: loads for the whole round (used by should_agent_respond check)."""
         result = await db.execute(
             select(Message)
             .options(selectinload(Message.agent))
@@ -304,15 +496,23 @@ class CouncilDebateEngine:
             )
             agent_memory = list(mem_result.scalars().all())
 
+            # Each agent gets a context window sized for their model type
+            # Local models: full history (free). API models: sliding window.
+            agent_context = await self._load_context_for_agent(agent, council.id, db)
+
             prompt_messages = await self.build_agent_prompt(
-                agent, council, recent_messages, agent_memory
+                agent, council, agent_context, agent_memory
             )
+
+            # Support per-agent Ollama URL for multi-machine collaboration
+            agent_ollama_url = (agent.config or {}).get("ollama_url")
 
             try:
                 full_text = await model_router.generate_full_text(
                     messages=prompt_messages,
                     model=agent.model_preference,
                     config={"temperature": 0.7, "max_tokens": 800},
+                    ollama_url=agent_ollama_url,
                 )
             except Exception as exc:
                 logger.error("Agent %s generation failed: %s", agent.name, exc)
