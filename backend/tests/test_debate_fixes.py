@@ -192,6 +192,21 @@ class TestClassifyQuestion:
         assert engine._classify_question("WHAT IS TODAY") == "factual"
         assert engine._classify_question("DEFINE entropy") == "factual"
 
+    def test_word_operator_arithmetic(self):
+        assert engine._classify_question("4 plus 5") == "factual"
+        assert engine._classify_question("10 minus 3") == "factual"
+        assert engine._classify_question("6 times 7") == "factual"
+        assert engine._classify_question("20 divided by 4") == "factual"
+
+    def test_technical_comparison_is_debate_not_opinion(self):
+        assert engine._classify_question("is Python better than JavaScript") == "debate"
+        assert engine._classify_question("is React better than Vue") == "debate"
+        assert engine._classify_question("is Linux better than Windows") == "debate"
+
+    def test_values_comparison_is_opinion(self):
+        assert engine._classify_question("is capitalism better for society") == "opinion"
+        assert engine._classify_question("is open source better for humanity") == "opinion"
+
 
 # ===========================================================================
 # Fix C: responder capping in run_round

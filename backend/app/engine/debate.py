@@ -98,6 +98,7 @@ def _strip_report_formatting(text: str, agent_name: str) -> str:
 
 _FACTUAL_PATTERNS = [
     r"\d+\s*[+\-*/x×÷]\s*\d+",                                    # arithmetic: 4+5, 9*6
+    r"\d+\s+(plus|minus|times|divided\s+by|multiplied\s+by)\s+\d+",  # word operators: 4 plus 5
     r"what\s+is\s+\d",                                              # "what is 2+2"
     r"what\s+(is|are|was|were)\s+(the\s+)?(date|time|day|year|month)",  # "what is the date/time"
     r"what['\u2019s]+\s*(the\s+)?(date|time|day|year|month)",      # "what's the date"
@@ -131,7 +132,7 @@ _OPINION_PATTERNS = [
     r"\b(is\s+it\s+(right|wrong|okay|acceptable|good|bad))\b",  # value judgments
     r"\bdo\s+you\s+support\b",                             # "do you support"
     r"\b(agree|disagree)\s+with\b",                         # "agree/disagree with"
-    r"\b(better|worse)\s+(than|for|off)\b",                 # comparative judgment
+    r"\b(better|worse)\s+(for\s+(society|humanity|the\s+world|people|us|everyone))\b",  # value judgment (not technical comparison)
     r"\bwould\s+you\s+(say|argue|support|prefer)\b",        # hypothetical stance
 ]
 
